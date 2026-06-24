@@ -15,7 +15,7 @@ Artık Pi OS'un sinir sistemine doğrudan bağlı:
     → Çöken container'dan son N satır log çekilip analiz edilir.
 
   Rate Limiter:
-    → Aynı (servis, hata_özeti) çifti 120 saniye içinde tekrar gelirse atlanır.
+    → Aynı (servis, hata_özeti) çifti 600 saniye içinde tekrar gelirse atlanır.
     → Aynı Docker container'dan burst gelirse 60sn beklenir.
 
   Proje Etiketleme (otomatik):
@@ -61,11 +61,11 @@ HEAL_LOG          = os.getenv("HEAL_LOG", "/home/pi/sre/heal_log.jsonl")
 ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
 MAX_LOCAL_TRIES   = 3
 MAC_CHECK_TIMEOUT = 3
-OLLAMA_TIMEOUT    = 120
+OLLAMA_TIMEOUT    = 600
 ANTHROPIC_TIMEOUT = 60
 
 # Rate limiter: (servis, hata_özeti) → son gönderim timestamp
-RATE_LIMIT_SECONDS = 120
+RATE_LIMIT_SECONDS = 600
 DOCKER_BURST_LIMIT = 60   # aynı container'dan burst
 
 # Gürültü filtresi: bunları LLM'e GÖNDERMEYİN
