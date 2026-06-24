@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/e32d2a76-ed9f-4a51-bcbe-3ee569194e79
+
 # SRE Daemon — AI Self-Healing Server
 
 > AI-powered self-healing SRE daemon for Raspberry Pi 5. Monitors systemd journals and Docker events in real-time, diagnoses errors with a hierarchical LLM stack (local → cloud), and executes auto-remediation — no human intervention needed.
