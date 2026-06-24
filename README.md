@@ -154,4 +154,4 @@ litellm --config litellm_config.yaml --port 4000
 
 ## License
 
-MIT
+Proprietary — All Rights Reserved. You may not use, copy, or distribute this software without explicit written permission from Onur Kapucu.
