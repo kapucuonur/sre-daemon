@@ -1,7 +1,5 @@
 # SRE Daemon — AI Self-Healing Engine (v5.1)
 
-![SRE Daemon Demo](ai_video.mp4)
-
 > An advanced, production-grade AI-powered self-healing SRE daemon for Raspberry Pi 5. It monitors systemd journals and Docker events in real-time, diagnoses errors using a 6-tier hierarchical LLM fallback stack, and executes safe auto-remediation with a Human-in-the-Loop (HITL) approval gateway.
 
 ---
@@ -85,18 +83,18 @@ pip install -r requirements.txt
 ### 2. Configure environment variables (`.env`):
 
 ```env
-# MacBook IP
-MAC_IP=192.168.1.105
+# MacBook IP (or any local client running Ollama)
+MAC_IP=192.168.x.x
 
 # API Keys
-GEMINI_API_KEY="AIzaSy..."
-GROQ_API_KEY="gsk_..."
-XAI_API_KEY="xai-..."
-ANTHROPIC_API_KEY="sk-ant-..."
+GEMINI_API_KEY="your-gemini-api-key"
+GROQ_API_KEY="your-groq-api-key"
+XAI_API_KEY="your-xai-api-key"
+ANTHROPIC_API_KEY="your-anthropic-api-key"
 
 # Telegram Integration
-TELEGRAM_BOT_TOKEN="8477141465:AAEs..."
-TELEGRAM_CHAT_ID="7491147357"
+TELEGRAM_BOT_TOKEN="your-telegram-bot-token"
+TELEGRAM_CHAT_ID="your-telegram-chat-id"
 ```
 
 ### 3. Start as a systemd service:
