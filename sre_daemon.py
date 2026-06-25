@@ -65,7 +65,7 @@ OLLAMA_TIMEOUT    = 600
 ANTHROPIC_TIMEOUT = 60
 
 # Rate limiter: (servis, hata_özeti) → son gönderim timestamp
-RATE_LIMIT_SECONDS = 600
+RATE_LIMIT_SECONDS = 120
 DOCKER_BURST_LIMIT = 60   # aynı container'dan burst
 
 # Gürültü filtresi: bunları LLM'e GÖNDERMEYİN
@@ -446,7 +446,7 @@ class AnthropicClient:
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-5", "max_tokens": 2048,
+                json={"model": "claude-sonnet-4-6", "max_tokens": 2048,
                       "messages": [{"role": "user", "content": prompt}]},
                 timeout=ANTHROPIC_TIMEOUT,
             )
@@ -639,7 +639,7 @@ class HealingOrchestrator:
         if not success:
             logger.warning("%s ANTHROPIC ESKALASYON...", project_tag)
             result = self.anthropic.query(prompt)
-            source = "anthropic/claude-sonnet-4-5"
+            source = "anthropic/claude-sonnet-4-6"
             success = result is not None
 
         # Auto-Remediation (Eylemleri Çalıştır)

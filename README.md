@@ -26,6 +26,7 @@ Raspberry Pi 5
 
 ## How It Works
 
+<<<<<<< Updated upstream
 1. **Monitor** — Systemd journal and Docker events are streamed in real-time
 2. **Detect** — Errors are classified by severity (emerg/alert/crit/err)
 3. **Diagnose** — Error sent to LLM failover chain; root cause identified
@@ -159,3 +160,32 @@ litellm --config litellm_config.yaml --port 4000
 ## License
 
 Proprietary — All Rights Reserved. You may not use, copy, or distribute this software without explicit written permission from TriHonor.
+=======
+1. **Systemd Journal** and **Docker Events** are monitored in real-time
+2. When an error is detected, it is sent to an LLM (hierarchical fallback):
+   - Mac online → Mac Ollama 
+>>>>>>> Stashed changes
+
+## Installation
+
+```bash
+git clone https://github.com/kapucuonur/sre-daemon.git
+cd sre-daemon
+pip install -r requirements.txt
+
+cp .env.example .env
+nano .env  # Fill in your values
+
+sudo cp sre-daemon.service /etc/systemd/system/
+sudo systemctl enable --now sre-daemon
+
+systemctl status sre-daemon
+```
+
+## Requirements
+
+- Linux server (Raspberry Pi 5 or any VPS)
+- Python 3.10+
+- Docker
+- Ollama (optional, for local LLM)
+- Anthropic API key (cloud fallback)
