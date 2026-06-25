@@ -1,10 +1,12 @@
 # SRE Daemon — AI Self-Healing Engine (v5.1)
 
+![SRE Daemon Demo](ai_video.mp4)
+
 > An advanced, production-grade AI-powered self-healing SRE daemon for Raspberry Pi 5. It monitors systemd journals and Docker events in real-time, diagnoses errors using a 6-tier hierarchical LLM fallback stack, and executes safe auto-remediation with a Human-in-the-Loop (HITL) approval gateway.
 
 ---
 
-## Mimarisi (Architecture)
+## Architecture
 
 ```
 Raspberry Pi 5
@@ -28,51 +30,51 @@ Raspberry Pi 5
 
 ---
 
-## Nasıl Çalışır? (How It Works)
+## How It Works
 
-1. **İzleme (Monitor)**: `systemd journal` ve Docker olayları gerçek zamanlı olarak dinlenir.
-2. **Sorun Tespiti (Detect)**: Hatalar ve container çökmeleri yakalanarak filtrelerden geçirilir.
-3. **Analiz (Analyze)**: Hata, 6 aşamalı LLM hiyerarşisine gönderilir. İlk çalışan model hatayı analiz eder, kök nedeni bulur ve bir aksiyon planı (`actions`) hazırlar.
-4. **Risk Sınıflandırması (Risk Assessment)**:
-   * **Düşük / Orta Risk (Low/Medium)**: Konteyner restartı, `requirements.txt` güncelleme vb. işlemler **otomatik** olarak uygulanır.
-   * **Yüksek / Kritik Risk (High/Critical)**: Kod yazma veya değiştirme işlemleri SQLite veri tabanına yazılır ve **Telegram Onay İstemi** tetiklenir.
-5. **Onay & Düzeltme (Remediate)**: Telegram üzerinden gelen `Kabul` / `Red` butonları ile işlem onaylanırsa kod atomik olarak güncellenir ve sistem ayağa kaldırılır.
-6. **Watchdog Koruması (Watchdog)**: Değişiklik sonrasında daemon kilitlenirse veya çökme döngüsüne girerse, bağımsız watchdog süreci otomatik olarak `git rollback` yapar.
+1. **Monitor**: `systemd journal` and Docker events are monitored in real-time.
+2. **Detection**: Errors and container crashes are captured and filtered.
+3. **Analysis**: The error is sent to a 6-stage hierarchical LLM pipeline. The first active model analyzes the error, identifies the root cause, and generates a remediation action plan (`actions`).
+4. **Risk Assessment**:
+   * **Low/Medium Risk**: Container restarts, `requirements.txt` updates, and similar minor operations are applied **automatically**.
+   * **High/Critical Risk**: Code writing or modifications are saved in the SQLite database, triggering a **Telegram Approval Prompt**.
+5. **Approval & Remediation**: Once the user approves or rejects via the `Approve` / `Reject` buttons on Telegram, the code is compiled, tested, and updated atomically.
+6. **Watchdog Protection**: If the daemon freezes or enters a crash loop after a change, an independent watchdog process automatically triggers a `git rollback` and restarts the service.
 
 ---
 
-## Örnek Arayüz ve Bildirimler (Telegram HITL)
+## Sample Interface & Notifications (Telegram HITL)
 
-Bir hata oluştuğunda bot üzerinden şu şekilde bildirim alınır ve kontrol edilir:
+When an error is detected, a notification is sent via the bot:
 
 ```
 🤖 AI SRE Manager — 25.06.2026 22:40
 
-🚨 [BikeFit-API] Hata Tespit Edildi!
-📍 Nerede: bikefit-api
-💥 Ne oldu: ModuleNotFoundError: No module named 'slowapi'
-🔧 Önerilen aksiyon: requirements.txt dosyasına 'slowapi' ekle
+🚨 [BikeFit-API] Error Detected!
+📍 Service: bikefit-api
+💥 Details: ModuleNotFoundError: No module named 'slowapi'
+🔧 Proposed Action: Add 'slowapi' to requirements.txt
 
-[ ✅ Kabul Et ]   [ ❌ Reddet ]
+[ ✅ Approve ]   [ ❌ Reject ]
 ```
 
 ---
 
-## Özellikler (Features)
+## Features
 
-| Özellik | Açıklama |
+| Feature | Description |
 | :--- | :--- |
-| **SQLite HITL State Store** | Onay bekleyen işlemleri kalıcı olarak tutar. Çökmelere ve restartlara karşı dayanıklıdır. |
-| **6-Aşamalı LLM Pipeline** | Yerel MacBook modelinden başlayıp, ücretsiz bulut modellerine (Gemini, Groq) ve son çare olarak Claude'a uzanan en tasarruflu API zinciri. |
-| **Atomic File Writes** | Kod değişiklikleri önce `.tmp` dosyasına yazılır, `py_compile` ve `import` testi ile doğrulanır, ardından atomik olarak değiştirilir. |
-| **Bağımsız Watchdog** | Her 5 saniyede bir `.heartbeat` dosyasını kontrol eder. Sistem kilitlenirse Git rollback tetikler ve servisi yeniden başlatır. |
-| **Güvenlik Sınırlandırması** | Sadece izin verilen komutlar (`docker compose`, `systemctl restart`) çalıştırılabilir; keyfi komutlar engellenir. |
+| **SQLite HITL State Store** | Persistently tracks pending approvals, surviving crashes and service restarts. |
+| **6-Tier LLM Pipeline** | Seamless failover starting from local MacBook LLM, to free cloud APIs (Gemini, Groq), and falling back to Claude as a last resort to minimize API costs. |
+| **Atomic File Writes** | Patches are written to a `.tmp` file, validated via `py_compile` and import check, then replaced atomically. |
+| **Independent Watchdog** | Monitors a `.heartbeat` file every 5s. Triggers `git rollback` and restarts the service if the system locks up. |
+| **Security Sandbox** | Strict whitelist for allowed commands (`docker compose`, `systemctl restart`); arbitrary shell execution is blocked. |
 
 ---
 
-## Kurulum (Setup)
+## Setup
 
-### 1. Dosyaları kopyalayın ve bağımlılıkları yükleyin:
+### 1. Clone the repository and install dependencies:
 
 ```bash
 git clone https://github.com/kapucuonur/sre-daemon.git
@@ -80,24 +82,24 @@ cd sre-daemon
 pip install -r requirements.txt
 ```
 
-### 2. Ortam değişkenlerini yapılandırın (`.env`):
+### 2. Configure environment variables (`.env`):
 
 ```env
 # MacBook IP
 MAC_IP=192.168.1.105
 
-# API Anahtarları
+# API Keys
 GEMINI_API_KEY="AIzaSy..."
 GROQ_API_KEY="gsk_..."
 XAI_API_KEY="xai-..."
 ANTHROPIC_API_KEY="sk-ant-..."
 
-# Telegram Entegrasyonu
+# Telegram Integration
 TELEGRAM_BOT_TOKEN="8477141465:AAEs..."
 TELEGRAM_CHAT_ID="7491147357"
 ```
 
-### 3. Servis olarak başlatın:
+### 3. Start as a systemd service:
 
 ```bash
 sudo cp sre-daemon.service /etc/systemd/system/
@@ -108,6 +110,6 @@ sudo systemctl start sre-daemon
 
 ---
 
-## Lisans (License)
+## License
 
 Proprietary — All Rights Reserved. You may not use, copy, or distribute this software without explicit written permission from TriHonor.
