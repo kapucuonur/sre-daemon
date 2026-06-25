@@ -112,6 +112,25 @@ sudo systemctl start sre-daemon
 
 ---
 
+## Future Roadmap & Vision
+
+We are evolving `sre-daemon` from a simple healing agent into a fully-featured **SRE ChatOps Platform**. Our goal is to balance full automation with surgical human control.
+
+* **[Planned] Telegram Log Insight**:
+  * Dynamic integration of critical log snippets (last 10-20 lines) directly into the Telegram approval card.
+  * Allows immediate diagnosis from your phone without needing to SSH into the Pi.
+* **[Planned] Interactive Human-in-the-Loop Patching**:
+  * Advanced approval workflow: If the AI-suggested patch needs a minor fix, you can reply to the Telegram bot with your edited version of the code.
+  * The daemon will validate your manual input, override the AI's proposal, and apply your verified code atomically.
+* **[Planned] Vector-Based Crash History (ChromaDB)**:
+  * Implement a long-term memory layer to store past crash signatures and successful repair patterns.
+  * The daemon will perform a lookup before calling an LLM, reducing latency and API costs for recurring issues.
+* **[Planned] "Circuit Breaker" Logic**:
+  * Automatically halt auto-remediation if a container exceeds a specific failure threshold (e.g., 3 crashes within 5 minutes), preventing "crash loops" and alerting the owner for a manual deep-dive.
+
+---
+
 ## License
 
 Proprietary — All Rights Reserved. You may not use, copy, or distribute this software without explicit written permission from TriHonor.
+
