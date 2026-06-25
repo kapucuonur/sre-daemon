@@ -1,39 +1,14 @@
 #!/usr/bin/env python3
 """
-SRE Daemon v3 — Total System Observer (Pi 5)
-=============================================
-v2'den farkı: Dosya tabanlı log okuma tamamen kaldırıldı.
-Artık Pi OS'un sinir sistemine doğrudan bağlı:
-
-  Kaynak 1 — Systemd Journal (journalctl -f -p err -o json)
-    → Kernel, donanım (Hailo AI modülü, USB kamera), systemd servisleri,
-      BikeFit-API, sre-daemon, nginx, PostgreSQL, vb.
-
-  Kaynak 2 — Docker Event Monitor
-    → trihonor-api-prod, coachonurai-api ve tüm container'lar.
-    → `docker events` ile yeni hata/çökme anında yakalanır.
-    → Çöken container'dan son N satır log çekilip analiz edilir.
-
-  Rate Limiter:
-    → Aynı (servis, hata_özeti) çifti 600 saniye içinde tekrar gelirse atlanır.
-    → Aynı Docker container'dan burst gelirse 60sn beklenir.
-
-  Proje Etiketleme (otomatik):
-    → journald _SYSTEMD_UNIT veya SYSLOG_IDENTIFIER'dan türetilir.
-    → Docker: container adından → [TriHonor-API], [AI-Coach], vb.
-    → Kernel mesajları: [Kernel-HW]
-    → Bilinmeyenler: [System]
-
-Hiyerarşik LLM Eskalasyon (v2 ile aynı):
-  1. Mac açık → Mac Ollama qwen2.5-coder:32b
-  2. Mac kapalı → Pi Ollama qwen2.5-coder:7b
-  3. 3 fail → Anthropic Claude Sonnet 4.6
-
-Güvenlik:
-  - API anahtarı yalnızca os.getenv ile okunur
-  - Loglar hiçbir zaman kimlik bilgisi içermez
-  - subprocess komutları sabit argümanlarla çalıştırılır (enjeksiyon yok)
-  - Dış ağ: yalnızca api.anthropic.com (HTTPS/TLS)
+SRE Daemon v5 — Hardened HITL & Self-Healing Engine (Pi 5)
+=============================================================
+A production-grade system-wide reliability daemon for Raspberry Pi 5.
+Implements:
+1. SQLite-based HITL (Human-in-the-loop) action state machine.
+2. Detached crash-loop PID and Heartbeat monitoring watchdog.
+3. Whitelisted Telegram callback polling listener.
+4. Atomic file modification with py_compile and import smoke testing.
+5. Deterministic risk classification.
 """
 
 import os
@@ -45,30 +20,42 @@ import threading
 import signal
 import re
 import subprocess
-from datetime import datetime, timezone
+import sqlite3
+import hashlib
+import difflib
+import stat
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
-
+from typing import Optional, List, Dict, Any
 import requests
 
-# ─────────────────────────────────────────────
-# Yapılandırma — .env'den okunur, ASLA hardcode değil
-# ─────────────────────────────────────────────
+# ── Configuration & Paths ────────────────────────────────────
 MAC_IP            = os.getenv("MAC_IP", "")
 MAC_OLLAMA_URL    = f"http://{MAC_IP}:11434"
 PI_OLLAMA_URL     = os.getenv("PI_OLLAMA_URL", "http://localhost:11434")
 HEAL_LOG          = os.getenv("HEAL_LOG", "/home/pi/sre/heal_log.jsonl")
 ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+LITELLM_API_KEY   = os.getenv("LITELLM_API_KEY", "")
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
+
+DB_PATH           = Path("/home/pi/sre/sre_state.db")
+HEARTBEAT_PATH    = Path("/home/pi/sre/.heartbeat")
+SELF_PATH         = Path(__file__).resolve()
 MAX_LOCAL_TRIES   = 3
-MAC_CHECK_TIMEOUT = 3
-OLLAMA_TIMEOUT    = 600
+OLLAMA_TIMEOUT    = 60
 ANTHROPIC_TIMEOUT = 60
+RATE_LIMIT_SECONDS = 600
+DOCKER_BURST_LIMIT = 60
 
-# Rate limiter: (servis, hata_özeti) → son gönderim timestamp
-RATE_LIMIT_SECONDS = 120
-DOCKER_BURST_LIMIT = 60   # aynı container'dan burst
+# Locks & Cooldown Cache
+ACTION_LOCK       = threading.Lock()
+SELF_FIX_LOCK     = threading.Lock()
+DECLINED_ERRORS   = {}  # error_hash -> timestamp
+DECLINED_COOLDOWN = 3600  # 1 hour cooldown for rejected issues
 
-# Gürültü filtresi: bunları LLM'e GÖNDERMEYİN
 NOISE_PATTERNS = re.compile(
     r"(DEBUG|audit\(|systemd-logind|NetworkManager.*state|"
     r"DHCP|avahi|dbus-daemon|Bluetooth|btusb|rfkill|"
@@ -76,7 +63,6 @@ NOISE_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
-# Proje etiket haritası — container/servis adı → etiket
 PROJECT_MAP = {
     "trihonor":       "[TriHonor-API]",
     "coachonurai":    "[AI-Coach]",
@@ -95,46 +81,7 @@ PROJECT_MAP = {
     "v4l":            "[Kernel-HW]",
 }
 
-
-def _validate_env():
-    errors = []
-    if not MAC_IP:
-        errors.append("MAC_IP tanımlanmamış")
-    if not ANTHROPIC_KEY or ANTHROPIC_KEY == "BURAYA_YENI_ANAHTARINIZI_GIRIN":
-        errors.append("ANTHROPIC_API_KEY tanımlanmamış veya placeholder")
-    if errors:
-        for e in errors:
-            logging.critical("ENV HATASI: %s", e)
-        sys.exit(1)
-
-
-def _tag_from_unit(unit: str, identifier: str, message: str) -> str:
-    """journald _SYSTEMD_UNIT ve SYSLOG_IDENTIFIER'dan proje etiketi türetir."""
-    combined = f"{unit} {identifier} {message}".lower()
-    for keyword, tag in PROJECT_MAP.items():
-        if keyword in combined:
-            return tag
-    # Servis adını direkt kullan
-    if unit and unit != "-":
-        clean = unit.replace(".service", "").replace(".scope", "")
-        return f"[{clean[:20]}]"
-    if identifier and identifier != "-":
-        return f"[{identifier[:20]}]"
-    return "[System]"
-
-
-def _tag_from_container(container_name: str) -> str:
-    """Docker container adından proje etiketi türetir."""
-    name_lower = container_name.lower()
-    for keyword, tag in PROJECT_MAP.items():
-        if keyword in name_lower:
-            return tag
-    return f"[{container_name[:20]}]"
-
-
-# ─────────────────────────────────────────────
-# Loglama
-# ─────────────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -146,13 +93,153 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sre-daemon")
 
+# ── Helper Functions ─────────────────────────────────────────
+def md_escape(text: str) -> str:
+    if text is None:
+        return ""
+    for ch in ["\\", "_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
-# ─────────────────────────────────────────────
-# Rate Limiter
-# ─────────────────────────────────────────────
+def atomic_write_text(target: Path, content: str):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f"{target.stem}.__sre_tmp__{target.suffix}")
+    orig_stat = target.stat() if target.exists() else None
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+
+    if orig_stat:
+        os.chmod(tmp_path, stat.S_IMODE(orig_stat.st_mode))
+        try:
+            os.chown(tmp_path, orig_stat.st_uid, orig_stat.st_gid)
+        except PermissionError:
+            pass
+
+    os.replace(tmp_path, target)
+
+def cleanup_old_prefix_tags(repo_path="/home/pi/sre", prefix="pre-fix-", max_age_hours=24):
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_path, "tag", "--list", f"{prefix}*"],
+            capture_output=True, text=True, timeout=10, check=True
+        )
+        now = time.time()
+        for tag in res.stdout.splitlines():
+            tag = tag.strip()
+            if not tag:
+                continue
+            m = re.match(rf"^{re.escape(prefix)}(\d+)", tag)
+            if not m:
+                continue
+            ts = int(m.group(1))
+            if now - ts > max_age_hours * 3600:
+                subprocess.run(
+                    ["git", "-C", repo_path, "tag", "-d", tag],
+                    capture_output=True, timeout=10
+                )
+    except Exception as e:
+        logger.warning("Tag cleanup hatası: %s", str(e))
+
+# ── SQLite HITL State Manager ────────────────────────────────
+def init_db():
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    error_hash TEXT,
+                    risk_level TEXT,
+                    actions_json TEXT,
+                    status TEXT,
+                    created_at TEXT,
+                    expires_at TEXT
+                )
+            """)
+            conn.commit()
+    except Exception as e:
+        logger.error("SQLite init hatası: %s", str(e))
+
+def add_pending_action(error_hash: str, risk_level: str, actions: List[Dict[str, Any]]) -> int:
+    init_db()
+    created = datetime.now(timezone.utc).isoformat()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    actions_str = json.dumps(actions)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO pending_actions (error_hash, risk_level, actions_json, status, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (error_hash, risk_level, actions_str, "pending", created, expires)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+def try_process_action(action_id: int, target_status: str) -> Optional[List[Dict[str, Any]]]:
+    """Idempotent and thread-safe transition of pending actions."""
+    with ACTION_LOCK:
+        init_db()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * pending_actions WHERE id = ?", (action_id,))
+            cursor.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            if row["status"] != "pending":
+                logger.warning("Action %d zaten işlenmiş (durum: %s)", action_id, row["status"])
+                return None
+            
+            # Check expiration
+            expires = datetime.fromisoformat(row["expires_at"])
+            if datetime.now(timezone.utc) > expires:
+                cursor.execute("UPDATE pending_actions SET status = 'timed_out' WHERE id = ?", (action_id,))
+                conn.commit()
+                logger.warning("Action %d zaman aşımına uğramış.", action_id)
+                return None
+            
+            cursor.execute("UPDATE pending_actions SET status = ? WHERE id = ?", (target_status, action_id))
+            conn.commit()
+            
+            if target_status == "approved":
+                return json.loads(row["actions_json"])
+            return None
+
+def timeout_worker():
+    while True:
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with ACTION_LOCK:
+                init_db()
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("""
+                        UPDATE pending_actions
+                        SET status = 'timed_out'
+                        WHERE status = 'pending' AND expires_at < ?
+                    """, (now_iso,))
+                    conn.commit()
+        except Exception as e:
+            logger.warning("Timeout worker hatası: %s", str(e))
+        time.sleep(15)
+
+# ── Heartbeat Thread ─────────────────────────────────────────
+def start_heartbeat():
+    def _run():
+        while True:
+            try:
+                HEARTBEAT_PATH.write_text(str(time.time()))
+            except Exception:
+                pass
+            time.sleep(5)
+    t = threading.Thread(target=_run, name="heartbeat", daemon=True)
+    t.start()
+
+# ── Rate Limiter ─────────────────────────────────────────────
 class RateLimiter:
-    """Aynı hata/servis kombinasyonunu belirli süre içinde sadece 1 kez iletir."""
-
     def __init__(self):
         self._seen: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -164,35 +251,16 @@ class RateLimiter:
             if now - last < limit_seconds:
                 return False
             self._seen[key] = now
-            # Bellek temizliği
             if len(self._seen) > 500:
                 oldest = min(self._seen, key=self._seen.get)
                 del self._seen[oldest]
             return True
 
-
-# ─────────────────────────────────────────────
-# Kaynak 1: Systemd Journal Watcher
-# ─────────────────────────────────────────────
+# ── Watchers ─────────────────────────────────────────────────
 class JournalWatcher:
-    """
-    journalctl -f -p err -o json ile Pi'nin tüm systemd/kernel
-    error akışını dinler.
-
-    Güvenlik: subprocess.Popen sabit argümanlarla çalıştırılır,
-    kullanıcı girdisi komut satırına hiçbir şekilde geçmez.
-    """
-
-    # Sadece priority 0-3 (emerg/alert/crit/err) dinliyoruz
-    # -n 0 ile başlangıçta eski logların tetiklenmesi önlenir
     JOURNAL_CMD = [
-        "journalctl",
-        "-f",           # follow (canlı akış)
-        "-n", "0",      # geçmiş logları atla
-        "-p", "err",    # err ve üstü (0-3)
-        "-o", "json",   # makine okunabilir çıktı
-        "--no-pager",
-        "--no-hostname",
+        "journalctl", "-f", "-n", "0", "-p", "err", "-o", "json",
+        "--no-pager", "--no-hostname"
     ]
 
     def __init__(self, rate_limiter: RateLimiter, callback):
@@ -202,9 +270,8 @@ class JournalWatcher:
         self._proc: Optional[subprocess.Popen] = None
 
     def start(self):
-        thread = threading.Thread(target=self._watch, name="journal-watcher", daemon=True)
-        thread.start()
-        logger.info("JournalWatcher başlatıldı (journalctl -f -p err)")
+        threading.Thread(target=self._watch, name="journal-watcher", daemon=True).start()
+        logger.info("JournalWatcher aktif.")
 
     def stop(self):
         self._stop_event.set()
@@ -228,15 +295,9 @@ class JournalWatcher:
                     if self._stop_event.is_set():
                         break
                     self._process_line(raw_line.strip())
-            except (OSError, ValueError) as e:
-                logger.error("JournalWatcher hata: %s — 10sn sonra yeniden deniyor", str(e))
+            except Exception as e:
+                logger.error("JournalWatcher hata: %s", str(e))
                 time.sleep(10)
-            finally:
-                if self._proc:
-                    try:
-                        self._proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        self._proc.kill()
 
     def _process_line(self, raw_line: str):
         if not raw_line:
@@ -251,54 +312,37 @@ class JournalWatcher:
         ident     = entry.get("SYSLOG_IDENTIFIER", "-")
         priority  = int(entry.get("PRIORITY", 6))
 
-        # Priority 4 (warning) ve üstünü filtrele — sadece 0-3 işle
         if priority > 3:
             return
-
-        # Gürültü filtresi
         if NOISE_PATTERNS.search(f"{unit} {ident} {message}"):
             return
 
-        # Güvenlik: mesaj maksimum 2000 karakter
         safe_msg = str(message)[:2000]
         if not safe_msg:
             return
 
-        tag = _tag_from_unit(unit, ident, safe_msg)
-        rate_key = f"journal:{unit}:{safe_msg[:80]}"
+        # Derive project tag
+        combined = f"{unit} {ident} {safe_msg}".lower()
+        tag = "[System]"
+        for keyword, mapped_tag in PROJECT_MAP.items():
+            if keyword in combined:
+                tag = mapped_tag
+                break
 
+        rate_key = f"journal:{unit}:{safe_msg[:80]}"
         if not self.rate_limiter.should_process(rate_key):
-            logger.debug("Rate limit — atlandı: %s", rate_key[:60])
             return
 
         priority_label = {0: "EMERG", 1: "ALERT", 2: "CRIT", 3: "ERR"}.get(priority, "ERR")
         tagged = f"{tag} [{priority_label}][{ident}] {safe_msg}"
-
-        logger.info("Journal hata yakalandı %s: %s", tag, safe_msg[:100])
         self.callback(tagged, tag)
 
-
-# ─────────────────────────────────────────────
-# Kaynak 2: Docker Event Watcher
-# ─────────────────────────────────────────────
 class DockerWatcher:
-    """
-    `docker events --filter type=container` ile container
-    die/oom/kill olaylarını dinler. Olay gelince container'ın
-    son loglarını çekip orchestrator'a iletir.
-
-    Güvenlik: container ID doğrulama ile injection önlenir.
-    """
-
-    CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")  # sadece hex ID kabul et
-
+    CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
     DOCKER_EVENTS_CMD = [
-        "docker", "events",
-        "--filter", "type=container",
-        "--filter", "event=die",
-        "--filter", "event=oom",
-        "--filter", "event=kill",
-        "--format", "{{json .}}",
+        "docker", "events", "--filter", "type=container",
+        "--filter", "event=die", "--filter", "event=oom", "--filter", "event=kill",
+        "--format", "{{json .}}"
     ]
 
     def __init__(self, rate_limiter: RateLimiter, callback):
@@ -308,9 +352,8 @@ class DockerWatcher:
         self._proc: Optional[subprocess.Popen] = None
 
     def start(self):
-        thread = threading.Thread(target=self._watch, name="docker-watcher", daemon=True)
-        thread.start()
-        logger.info("DockerWatcher başlatıldı (docker events: die/oom/kill)")
+        threading.Thread(target=self._watch, name="docker-watcher", daemon=True).start()
+        logger.info("DockerWatcher aktif.")
 
     def stop(self):
         self._stop_event.set()
@@ -334,8 +377,8 @@ class DockerWatcher:
                     if self._stop_event.is_set():
                         break
                     self._process_event(raw_line.strip())
-            except (OSError, ValueError) as e:
-                logger.error("DockerWatcher hata: %s — 15sn sonra yeniden deniyor", str(e))
+            except Exception as e:
+                logger.error("DockerWatcher hata: %s", str(e))
                 time.sleep(15)
 
     def _process_event(self, raw_line: str):
@@ -350,128 +393,151 @@ class DockerWatcher:
         container_name = event.get("Actor", {}).get("Attributes", {}).get("name", "unknown")
         action         = event.get("Action", "die")
 
-        # Güvenlik: container ID yalnızca hex karakterler içermeli
-        # (inspect/logs komutuna geçmeden önce doğrula)
         if not self.CONTAINER_ID_RE.match(container_id):
-            logger.warning("Geçersiz container ID formatı, atlandı")
             return
 
-        tag = _tag_from_container(container_name)
+        tag = "[Docker]"
+        name_lower = container_name.lower()
+        for keyword, mapped_tag in PROJECT_MAP.items():
+            if keyword in name_lower:
+                tag = mapped_tag
+                break
+
         rate_key = f"docker:{container_name}:{action}"
-
         if not self.rate_limiter.should_process(rate_key, DOCKER_BURST_LIMIT):
-            logger.debug("Docker rate limit — atlandı: %s", rate_key)
             return
 
-        logger.warning("Docker olayı: %s %s → %s", action.upper(), container_name, tag)
+        # Fetch logs
+        try:
+            res = subprocess.run(["docker", "logs", "--tail", "30", container_id], capture_output=True, text=True, timeout=10)
+            logs = (res.stdout + res.stderr).strip()
+            error_lines = [l for l in logs.splitlines() if re.search(r"error|exception|traceback|fatal|fail", l, re.IGNORECASE)]
+            log_summary = "\n".join(error_lines[-20:]) if error_lines else logs[-1000:]
+        except Exception as e:
+            log_summary = f"Log hatası: {str(e)}"
 
-        # Son 30 satır logu çek
-        logs = self._fetch_logs(container_id, container_name)
-        tagged = f"{tag} [DOCKER-{action.upper()}] Container '{container_name}' çöktü.\nSon loglar:\n{logs}"
+        tagged = f"{tag} [DOCKER-{action.upper()}] Container '{container_name}' çöktü.\nSon loglar:\n{log_summary}"
         self.callback(tagged, tag)
 
-    def _fetch_logs(self, container_id: str, container_name: str) -> str:
-        """Güvenlik: container_id doğrulanmış hex string. Eğer container silinmişse isme fallback yapar."""
-        try:
-            result = subprocess.run(
-                ["docker", "logs", "--tail", "30", container_id],
-                capture_output=True, text=True, timeout=10
-            )
-            output = (result.stdout + result.stderr).strip()
-            
-            # Eğer container bulunamadıysa isme fallback yap
-            if "No such container" in output or not output:
-                if container_name and re.match(r"^[a-zA-Z0-9_-]+$", container_name):
-                    result = subprocess.run(
-                        ["docker", "logs", "--tail", "30", container_name],
-                        capture_output=True, text=True, timeout=10
-                    )
-                    output = (result.stdout + result.stderr).strip()
-
-            # Sadece ERROR içeren satırları filtrele
-            error_lines = [l for l in output.splitlines()
-                           if re.search(r"error|exception|traceback|fatal|fail", l, re.IGNORECASE)]
-            return "\n".join(error_lines[-20:]) if error_lines else output[-1000:]
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return f"Log alınamadı: {str(e)}"
-
-
-# ─────────────────────────────────────────────
-# LLM İstemcileri (v2 ile aynı)
-# ─────────────────────────────────────────────
+# ── Clients ──────────────────────────────────────────────────
 class MacChecker:
     def is_mac_online(self) -> bool:
         if not MAC_IP:
             return False
         try:
-            resp = requests.get(f"{MAC_OLLAMA_URL}/api/tags", timeout=MAC_CHECK_TIMEOUT)
+            resp = requests.get(f"{MAC_OLLAMA_URL}/api/tags", timeout=3)
             return resp.status_code == 200
-        except requests.exceptions.RequestException:
+        except Exception:
             return False
-
 
 class OllamaClient:
     def query(self, base_url: str, model: str, prompt: str) -> Optional[str]:
-        allowed = {MAC_OLLAMA_URL, PI_OLLAMA_URL}
-        if base_url not in allowed:
-            logger.error("İzin verilmeyen URL reddedildi: %s", base_url)
-            return None
         try:
             resp = requests.post(
                 f"{base_url}/api/generate",
-                json={"model": model, "prompt": prompt,
-                      "stream": False, "options": {"temperature": 0.2}},
+                json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.2}},
                 timeout=OLLAMA_TIMEOUT,
                 headers={"Content-Type": "application/json"}
             )
             resp.raise_for_status()
             return resp.json().get("response", "").strip()
-        except requests.exceptions.ConnectionError:
-            logger.warning("Ollama bağlantı hatası: %s", base_url)
-        except requests.exceptions.Timeout:
-            logger.warning("Ollama timeout: %s (model: %s)", base_url, model)
-        except requests.exceptions.RequestException as e:
-            logger.error("Ollama istek hatası: %s", str(e))
+        except Exception as e:
+            logger.warning("Ollama hatası (%s): %s", base_url, str(e))
         return None
 
+class GeminiClient:
+    def query(self, prompt: str) -> Optional[str]:
+        if not GEMINI_API_KEY:
+            return None
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt}
+                        ]
+                    }
+                ]
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            res_json = resp.json()
+            text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+            return text.strip()
+        except Exception as e:
+            logger.error("Gemini API hatası: %s", str(e))
+        return None
+
+class GroqClient:
+    def query(self, prompt: str) -> Optional[str]:
+        if not GROQ_API_KEY:
+            return None
+        try:
+            if GROQ_API_KEY.startswith("xai-"):
+                url = "https://api.x.ai/v1/chat/completions"
+                model = "grok-2-1212"
+            else:
+                url = "https://api.groq.com/openai/v1/chat/completions"
+                model = "qwen-2.5-coder-32b"
+
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            res_json = resp.json()
+            text = res_json["choices"][0]["message"]["content"]
+            return text.strip()
+        except Exception as e:
+            logger.error("Groq/xAI API hatası: %s", str(e))
+        return None
 
 class AnthropicClient:
     def query(self, prompt: str) -> Optional[str]:
-        key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not key or key == "BURAYA_YENI_ANAHTARINIZI_GIRIN":
-            logger.critical("Anthropic API anahtarı geçersiz — eskalasyon iptal")
+        if not ANTHROPIC_KEY:
             return None
         try:
             resp = requests.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": 2048,
-                      "messages": [{"role": "user", "content": prompt}]},
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-4-6", "max_tokens": 2048, "messages": [{"role": "user", "content": prompt}]},
                 timeout=ANTHROPIC_TIMEOUT,
             )
             resp.raise_for_status()
             return resp.json()["content"][0]["text"].strip()
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logger.error("Anthropic API hatası: %s", str(e))
         return None
 
-
-# ─────────────────────────────────────────────
-# Healing Orchestrator
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# Healing Orchestrator (v4 - Auto-Remediation Engine)
-# ─────────────────────────────────────────────
+# ── Healing Orchestrator & Action Runner ─────────────────────
 class HealingOrchestrator:
     def __init__(self):
         self.mac_checker  = MacChecker()
         self.ollama       = OllamaClient()
+        self.gemini       = GeminiClient()
+        self.groq         = GroqClient()
         self.anthropic    = AnthropicClient()
 
-    def handle_error(self, tagged_line: str, project_tag: str):
+    def handle_error(self, tagged_line: str, project_tag: str, err_hash: str):
+        # Cooldown / Dedup Check
+        now = time.time()
+        if err_hash in DECLINED_ERRORS:
+            if now - DECLINED_ERRORS[err_hash] < DECLINED_COOLDOWN:
+                logger.info("Aynı hata son 1 saatte reddedilmiş, yoksayılıyor: %s", project_tag)
+                return
+
         threading.Thread(
-            target=self._heal, args=(tagged_line, project_tag),
+            target=self._heal, args=(tagged_line, project_tag, err_hash),
             name=f"healer-{project_tag}", daemon=True
         ).start()
 
@@ -490,8 +556,10 @@ class HealingOrchestrator:
             "3. Eğer hata otomatik olarak düzeltilebiliyorsa (örn: eksik python kütüphanesini requirements.txt'e ekleme, konteyner veya servis restart etme), bunu eylemler ('actions') dizisi olarak tanımla.\n\n"
             "Eylemler türleri:\n"
             "- 'append': Bir dosyaya yeni bir satır eklemek için (örn: target='/home/pi/bikefit-api/requirements.txt', payload='slowapi')\n"
+            "- 'write': Bir dosyanın üzerine tam kod içeriğini yazmak için.\n"
+            "- 'replace': Bir dosyada belirli bir kod bloğunu yeni kod bloğuyla değiştirmek için.\n"
             "- 'shell': Güvenli bir komut çalıştırmak için (örn: target='/home/pi/bikefit', payload='docker compose up -d --build bikefit-api').\n"
-            "  NOT: Shell komutlarında 'target' alanı docker-compose.yml dosyasının bulunduğu DİZİN olmalıdır (yukarıdaki dizin haritasına dikkat et!). Shell komutları yalnızca docker compose, docker restart veya systemctl restart/start komutları olmalıdır. Güvenli olmayan veya izin verilmeyen hiçbir komut çalıştırma!\n\n"
+            "  NOT: Shell komutları yalnızca docker compose, docker restart veya systemctl restart/start komutları olmalıdır. Güvenli olmayan veya izin verilmeyen hiçbir komut çalıştırma!\n\n"
             f"HATA:\n{tagged_line[:1500]}\n\n"
             "JSON formatında yanıt ver. Yanıtın mutlaka geçerli bir JSON olmalıdır ve kod blokları içermemelidir. Örnek şema:\n"
             "{\n"
@@ -504,155 +572,358 @@ class HealingOrchestrator:
             "}"
         )
 
-    def _execute_actions(self, result_str: str, project_tag: str) -> list:
-        """JSON yanıtından eylemleri parse edip güvenli bir şekilde çalıştırır."""
-        executed = []
-        try:
-            # Markdown json bloklarını temizle (varsa)
-            cleaned = result_str.strip()
-            if cleaned.startswith("```json"):
-                cleaned = cleaned[7:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
+    def _classify_risk(self, actions: List[Dict[str, Any]]) -> str:
+        """Deterministik kural tabanlı risk sınıflandırması."""
+        max_risk = "Low"
+        for act in actions:
+            act_type = act.get("type", "")
+            target = act.get("target", "")
+            
+            if target and Path(target).resolve() == SELF_PATH:
+                return "Critical"
+            
+            if act_type in ("write", "replace"):
+                if target.endswith((".py", ".js", ".jsx", ".db", ".json", ".sh")):
+                    max_risk = "High" if max_risk != "Critical" else "Critical"
+            elif act_type == "append" and "requirements.txt" in target:
+                if max_risk == "Low":
+                    max_risk = "Medium"
+        return max_risk
 
-            data = json.loads(cleaned)
-            actions = data.get("actions", [])
-            if not isinstance(actions, list):
-                return [{"status": "failed", "error": "actions liste değil"}]
-
-            for act in actions:
-                act_type = act.get("type")
-                target = act.get("target", "").strip()
-                payload = act.get("payload", "").strip()
-
-                if not act_type or not target or not payload:
-                    continue
-
-                if act_type == "append":
-                    # Güvenlik doğrulaması: target /home/pi ile başlamalı, .. içermemeli, /sre/ içermemeli
-                    target_path = Path(target).resolve()
-                    if not target.startswith("/home/pi/") or ".." in target or "/sre/" in target:
-                        logger.warning("%s Güvenlik engeli: Geçersiz append hedefi: %s", project_tag, target)
-                        executed.append({"type": "append", "target": target, "status": "rejected", "reason": "güvenlik engeli"})
-                        continue
-                    try:
-                        # Son satırın yeni satır karakteriyle bitmesini sağla ve ekle
-                        if target_path.exists():
-                            with open(target_path, "a", encoding="utf-8") as f:
-                                if target_path.stat().st_size > 0:
-                                    with open(target_path, "rb+") as f_binary:
-                                        f_binary.seek(-1, 2)
-                                        last_char = f_binary.read(1)
-                                        if last_char != b'\n':
-                                            f.write("\n")
-                                f.write(payload + "\n")
-                        else:
-                            with open(target_path, "w", encoding="utf-8") as f:
-                                f.write(payload + "\n")
-                        logger.info("%s Otomatik Onarım: %s dosyasına eklendi: %s", project_tag, target, payload)
-                        executed.append({"type": "append", "target": target, "payload": payload, "status": "success"})
-                    except OSError as e:
-                        logger.error("%s Dosya ekleme hatası: %s", project_tag, str(e))
-                        executed.append({"type": "append", "target": target, "payload": payload, "status": "failed", "error": str(e)})
-
-                elif act_type == "shell":
-                    # Güvenlik doğrulaması: target /home/pi ile başlamalı, .. içermemeli, /sre/ içermemeli
-                    if not target.startswith("/home/pi/") or ".." in target or "/sre/" in target:
-                        logger.warning("%s Güvenlik engeli: Geçersiz shell dizini: %s", project_tag, target)
-                        executed.append({"type": "shell", "target": target, "status": "rejected", "reason": "güvenlik engeli"})
-                        continue
-
-                    # Komut whitelisting
-                    allowed_patterns = [
-                        r"^docker\s+compose\s+(up\s+-d\s+--build|restart|up\s+-d)(\s+[a-zA-Z0-9_-]+)?$",
-                        r"^docker\s+restart\s+[a-zA-Z0-9_-]+$",
-                        r"^systemctl\s+(restart|start)\s+[a-zA-Z0-9_-]+$"
-                    ]
-                    is_allowed = any(re.match(pat, payload) for pat in allowed_patterns)
-                    
-                    if not is_allowed or any(char in payload for char in [";", "|", "&", "`", "$", "\n", "\r"]):
-                        logger.warning("%s Güvenlik engeli: İzin verilmeyen shell komutu: %s", project_tag, payload)
-                        executed.append({"type": "shell", "target": target, "payload": payload, "status": "rejected", "reason": "güvenlik engeli"})
-                        continue
-
-                    try:
-                        logger.info("%s Otomatik Onarım: Cwd: %s, Komut çalıştırılıyor: %s", project_tag, target, payload)
-                        cmd_args = payload.split()
-                        if cmd_args[0] == "systemctl":
-                            cmd_args = ["sudo", "systemctl"] + cmd_args[1:]
-                            
-                        result = subprocess.run(
-                            cmd_args,
-                            cwd=target,
-                            capture_output=True,
-                            text=True,
-                            timeout=60
-                        )
-                        if result.returncode == 0:
-                            logger.info("%s Komut başarıyla çalıştırıldı: %s", project_tag, payload)
-                            executed.append({"type": "shell", "target": target, "payload": payload, "status": "success", "stdout": result.stdout[:500]})
-                        else:
-                            logger.error("%s Komut başarısız oldu (code %d): %s\nStderr: %s", project_tag, result.returncode, payload, result.stderr)
-                            executed.append({"type": "shell", "target": target, "payload": payload, "status": "failed", "code": result.returncode, "error": result.stderr[:500]})
-                    except (subprocess.SubprocessError, OSError) as e:
-                        logger.error("%s Komut çalıştırma hatası: %s", project_tag, str(e))
-                        executed.append({"type": "shell", "target": target, "payload": payload, "status": "failed", "error": str(e)})
-
-        except json.JSONDecodeError as e:
-            logger.error("%s JSON parse hatası: %s", project_tag, str(e))
-            executed.append({"status": "failed", "error": f"JSON parse hatası: {str(e)}"})
-        except Exception as e:
-            logger.error("%s Beklenmedik hata: %s", project_tag, str(e))
-            executed.append({"status": "failed", "error": str(e)})
-
-        return executed
-
-    def _heal(self, tagged_line: str, project_tag: str):
+    def _heal(self, tagged_line: str, project_tag: str, err_hash: str):
         prompt = self._build_prompt(tagged_line, project_tag)
         result = None
         source = None
         success = False
 
         mac_online = self.mac_checker.is_mac_online()
-        logger.info("%s Mac: %s", project_tag,
-                    "AÇIK ✅" if mac_online else "KAPALI 🌙")
-
-        for attempt in range(1, MAX_LOCAL_TRIES + 1):
-            if mac_online:
-                logger.info("%s [%d/%d] Mac Ollama qwen2.5-coder:32b...",
-                            project_tag, attempt, MAX_LOCAL_TRIES)
+        if mac_online:
+            for attempt in range(1, MAX_LOCAL_TRIES + 1):
                 result = self.ollama.query(MAC_OLLAMA_URL, "qwen2.5-coder:32b", prompt)
                 source = "mac-ollama/qwen2.5-coder:32b"
-            else:
-                logger.info("%s [%d/%d] Pi Ollama qwen2.5-coder:7b...",
-                            project_tag, attempt, MAX_LOCAL_TRIES)
+                if result:
+                    success = True
+                    break
+                time.sleep(5 * attempt)
+
+        # 2. Google Gemini API (Free tier)
+        if not success and GEMINI_API_KEY:
+            result = self.gemini.query(prompt)
+            source = "gemini/gemini-2.5-flash"
+            success = result is not None
+
+        # 3. Groq / xAI API (Free/Cheap tier)
+        if not success and GROQ_API_KEY:
+            result = self.groq.query(prompt)
+            source = "groq-xai/grok-or-qwen"
+            success = result is not None
+
+        # 4. Local Pi Ollama (Offline fallback)
+        if not success:
+            for attempt in range(1, MAX_LOCAL_TRIES + 1):
                 result = self.ollama.query(PI_OLLAMA_URL, "qwen2.5-coder:7b", prompt)
                 source = "pi-ollama/qwen2.5-coder:7b"
+                if result:
+                    success = True
+                    break
+                time.sleep(5 * attempt)
 
-            if result:
-                success = True
-                break
-            logger.warning("%s [%d/%d] başarısız.", project_tag, attempt, MAX_LOCAL_TRIES)
-            time.sleep(5 * attempt)
-
+        # 5. Anthropic Claude (Expensive cloud fallback)
         if not success:
-            logger.warning("%s ANTHROPIC ESKALASYON...", project_tag)
             result = self.anthropic.query(prompt)
             source = "anthropic/claude-sonnet-4-6"
             success = result is not None
 
-        # Auto-Remediation (Eylemleri Çalıştır)
-        actions_status = []
         if success and result:
-            logger.info("%s Onarım kararı alındı. Eylemler çözümleniyor...", project_tag)
-            actions_status = self._execute_actions(result, project_tag)
+            try:
+                # Clean JSON markdown blocks
+                cleaned = result.strip()
+                if cleaned.startswith("```json"):
+                    cleaned = cleaned[7:]
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3]
+                data = json.loads(cleaned.strip())
+                actions = data.get("actions", [])
+                
+                risk_level = self._classify_risk(actions)
+                logger.info("%s Analiz sonucu risk seviyesi: %s", project_tag, risk_level)
+                
+                if risk_level in ("Low", "Medium"):
+                    # Otonom çalıştır
+                    executed_status = self.execute_approved_actions(actions, 0)
+                    self._write_heal_log(tagged_line, result, source, True, project_tag, executed_status)
+                else:
+                    # HITL Telegram Onay Akışı
+                    action_id = add_pending_action(err_hash, risk_level, actions)
+                    self._send_approval_request(action_id, data, tagged_line, risk_level, project_tag)
+            except Exception as e:
+                logger.error("Analiz parse hatası: %s", str(e))
+                self._write_heal_log(tagged_line, result, source, False, project_tag, [{"error": str(e)}])
 
-        self._write_heal_log(tagged_line, result, source, success, project_tag, actions_status)
-        if success:
-            logger.info("%s ✅ Analiz tamamlandı → %s", project_tag, source)
-        else:
-            logger.critical("%s ❌ TÜM KAYNAKLAR BAŞARISIZ.", project_tag)
+    def _send_approval_request(self, action_id: int, data: dict, error_msg: str, risk: str, tag: str):
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.warning("Telegram token eksik, onay isteği gönderilemiyor.")
+            return
+
+        actions = data.get("actions", [])
+        actions_summary = ""
+        for act in actions:
+            act_type = act.get("type", "")
+            target = act.get("target", "")
+            payload_preview = act.get("payload", "")[:100]
+            actions_summary += f"• {md_escape(act_type)} -> {md_escape(target)} ({md_escape(payload_preview)}...)\n"
+
+        root_cause = md_escape(data.get("root_cause", ""))
+        tag_safe = md_escape(tag)
+        risk_safe = md_escape(risk)
+
+        msg = (
+            f"🚨 *SRE Daemon v5: Onay Bekleyen Aksiyon*\n\n"
+            f"📍 *Nerede*: {tag_safe}\n"
+            f"⚡ *Risk Seviyesi*: `{risk_safe}`\n"
+            f"📝 *Kök Neden*: {root_cause}\n\n"
+            f"⚙️ *Önerilen Aksiyonlar*:\n{actions_summary}\n"
+            f"⏰ *Zaman Aşımı*: 10 dakika (otomatik red)\n\n"
+            f"Lütfen aşağıdaki butonlarla onayı onaylayın."
+        )
+
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Uygula", "callback_data": f"approve_{action_id}"},
+                    {"text": "❌ Reddet", "callback_data": f"reject_{action_id}"}
+                ]
+            ]
+        }
+
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": "Markdown",
+                "reply_markup": reply_markup
+            }, timeout=10)
+        except Exception as e:
+            logger.error("Telegram onay isteği gönderme hatası: %s", str(e))
+
+    def execute_approved_actions(self, actions: List[Dict[str, Any]], action_id: int) -> List[Dict[str, Any]]:
+        executed = []
+        is_self_fix = any(
+            act.get("target") and Path(act.get("target")).resolve() == SELF_PATH
+            for act in actions
+        )
+        timestamp = str(int(time.time()))
+        tag_name = f"pre-fix-{timestamp}"
+
+        if is_self_fix:
+            if not SELF_FIX_LOCK.acquire(blocking=False):
+                return [{"status": "rejected", "reason": "self-fix already in progress"}]
+            try:
+                # Git Tag backup point creation before modifications
+                subprocess.run(["git", "-C", "/home/pi/sre", "tag", "-a", tag_name, "-m", f"SRE pre-fix backup {timestamp}"], check=True)
+                logger.info("Kritik self-fix yedekleme etiketi oluşturuldu: %s", tag_name)
+            except Exception as e:
+                logger.error("Git tag oluşturma hatası: %s", str(e))
+                SELF_FIX_LOCK.release()
+                return [{"status": "failed", "error": f"Git tag yedekleme hatası: {str(e)}"}]
+
+        try:
+            for act in actions:
+                act_type = act.get("type")
+                target   = act.get("target", "").strip()
+                payload  = act.get("payload", "")
+
+                # Security target normalization check
+                if target:
+                    target_path = Path(target).resolve()
+                    if not str(target_path).startswith("/home/pi/") or ".." in target or "/sre/.env" in target:
+                        logger.warning("Güvenlik engeli: hedef dizin geçersiz veya yasaklı: %s", target)
+                        executed.append({"status": "rejected", "reason": "hedef güvenlik engeli"})
+                        continue
+
+                if act_type in ("write", "replace"):
+                    target_path = Path(target)
+                    tmp_path = target_path.with_name(f"{target_path.stem}.__sre_tmp__{target_path.suffix}")
+                    try:
+                        if act_type == "write":
+                            new_content = payload
+                        else:
+                            search_str = act.get("search", "")
+                            replace_str = act.get("replace", "")
+                            orig_content = target_path.read_text(encoding="utf-8")
+                            count = orig_content.count(search_str)
+                            if count == 0:
+                                raise ValueError(f"Değiştirilecek içerik bulunamadı: {search_str[:50]}")
+                            if count > 1:
+                                raise ValueError(f"Replace belirsiz: {count} eşleşme bulundu")
+                            new_content = orig_content.replace(search_str, replace_str, 1)
+
+                        with open(tmp_path, "w", encoding="utf-8") as f:
+                            f.write(new_content)
+                            f.flush()
+                            os.fsync(f.fileno())
+
+                        # Validation tests on temporary files
+                        if target.endswith(".py"):
+                            py_compile_res = subprocess.run(
+                                ["python3", "-m", "py_compile", str(tmp_path)],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if py_compile_res.returncode != 0:
+                                raise ValueError(f"Syntax Validation Hata: {py_compile_res.stderr}")
+
+                            if target_path.resolve() == SELF_PATH:
+                                selftest_res = subprocess.run(
+                                    ["python3", str(tmp_path), "--self-test"],
+                                    capture_output=True, text=True, timeout=10
+                                )
+                                if selftest_res.returncode != 0:
+                                    raise ValueError(f"Self-test hatası: {selftest_res.stderr}")
+
+                        atomic_write_text(target_path, new_content)
+                        executed.append({"type": act_type, "target": target, "status": "success"})
+                        logger.info("Atomic %s işlemi başarıyla uygulandı: %s", act_type, target)
+                    except Exception as ex:
+                        logger.error("Dosya düzenleme hatası: %s", str(ex))
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                        executed.append({"type": act_type, "target": target, "status": "failed", "error": str(ex)})
+
+                elif act_type == "append":
+                    try:
+                        if "requirements.txt" in target:
+                            target_path = Path(target)
+                            original = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
+                            new_content = original + ("" if original.endswith("\n") or not original else "\n") + payload + "\n"
+                            atomic_write_text(target_path, new_content)
+
+                            pkg_match = re.match(r"^([a-zA-Z0-9_-]+)", payload.strip())
+                            if pkg_match:
+                                pkg_name = pkg_match.group(1)
+                                install_res = subprocess.run(
+                                    ["pip", "install", pkg_name, "--break-system-packages"],
+                                    capture_output=True, text=True, timeout=30
+                                )
+                                if install_res.returncode != 0:
+                                    atomic_write_text(target_path, original)
+                                    raise ValueError(f"pip install başarısız: {install_res.stderr[:300]}")
+                                test_import = subprocess.run(
+                                    ["python3", "-c", f"import {pkg_name}"],
+                                    capture_output=True, text=True, timeout=10
+                                )
+                                if test_import.returncode != 0:
+                                    atomic_write_text(target_path, original)
+                                    raise ValueError(f"Paket yüklendi ancak import testi başarısız: {pkg_name}")
+                        else:
+                            with open(target, "a", encoding="utf-8") as f:
+                                f.write(payload + "\n")
+                        executed.append({"type": "append", "target": target, "status": "success"})
+                    except Exception as ex:
+                        executed.append({"type": "append", "target": target, "status": "failed", "error": str(ex)})
+
+                elif act_type == "shell":
+                    # Command whitelist filter
+                    allowed_patterns = [
+                        r"^docker\s+compose\s+(up\s+-d\s+--build|restart|up\s+-d)(\s+[a-zA-Z0-9_-]+)?$",
+                        r"^docker\s+restart\s+[a-zA-Z0-9_-]+$",
+                        r"^systemctl\s+(restart|start)\s+[a-zA-Z0-9_.-]+$"
+                    ]
+                    is_allowed = any(re.match(pat, payload) for pat in allowed_patterns)
+                    if not is_allowed or any(char in payload for char in [";", "|", "&", "`", "$", "\n", "\r"]):
+                        executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "yasaklı komut"})
+                        continue
+
+                    try:
+                        cmd_args = payload.split()
+                        if cmd_args[0] == "systemctl":
+                            cmd_args = ["sudo", "/usr/bin/systemctl"] + cmd_args[1:]
+                        
+                        result = subprocess.run(cmd_args, cwd=target if target else None, capture_output=True, text=True, timeout=60)
+                        if result.returncode == 0:
+                            executed.append({"type": "shell", "payload": payload, "status": "success", "stdout": result.stdout[:500]})
+                        else:
+                            executed.append({"type": "shell", "payload": payload, "status": "failed", "error": result.stderr[:500]})
+                    except Exception as ex:
+                        executed.append({"type": "shell", "payload": payload, "status": "failed", "error": str(ex)})
+
+            if is_self_fix:
+                success_count = sum(1 for e in executed if e.get("status") == "success")
+                if success_count == len(actions):
+                    # Commit SRE self-fix changes
+                    try:
+                        subprocess.run(["git", "-C", "/home/pi/sre", "add", "-A"], check=True)
+                        diff_check = subprocess.run(["git", "-C", "/home/pi/sre", "diff", "--cached", "--quiet"])
+                        if diff_check.returncode == 0:
+                            raise ValueError("Commitlenecek değişiklik yok")
+                        subprocess.run(["git", "-C", "/home/pi/sre", "commit", "-m", f"SRE self-fix: {timestamp}"], check=True)
+                        logger.info("SRE self-fix başarıyla commit edildi.")
+                    except Exception as e:
+                        logger.error("Git commit hatası: %s", str(e))
+                        subprocess.run(["git", "-C", "/home/pi/sre", "reset", "--hard", tag_name], capture_output=True)
+                        subprocess.run(["git", "-C", "/home/pi/sre", "tag", "-d", tag_name], capture_output=True)
+                        return executed + [{"status": "failed", "error": f"git commit failed: {e}"}]
+                    
+                    # Detached Watchdog Spawning with MainPID and heartbeat checks
+                    watchdog_script = f"""(
+                      sleep 10
+                      PID1="\$(/usr/bin/systemctl show sre-daemon -p MainPID --value)"
+                      ACTIVE1="\$(/usr/bin/systemctl is-active sre-daemon)"
+                      sleep 10
+                      PID2="\$(/usr/bin/systemctl show sre-daemon -p MainPID --value)"
+                      ACTIVE2="\$(/usr/bin/systemctl is-active sre-daemon)"
+                      
+                      # Heartbeat modify check
+                      MOD_TIME=\$(stat -c %Y /home/pi/sre/.heartbeat 2>/dev/null || echo 0)
+                      NOW=\$(date +%s)
+                      HEARTBEAT_AGE=\$((NOW - MOD_TIME))
+
+                      if [ -n "\$PID1" ] && [ -n "\$PID2" ] && \
+                         [ "\$ACTIVE1" = "active" ] && [ "\$ACTIVE2" = "active" ] && \
+                         [ "\$PID1" -eq "\$PID2" ] && [ "\$PID1" -ne 0 ] && \
+                         [ \$HEARTBEAT_AGE -lt 15 ]; then
+                        echo "Stabilization check passed." >> /home/pi/sre/watchdog.log
+                      else
+                        echo "Unstable service detected. Rolling back..." >> /home/pi/sre/watchdog.log
+                        echo "Rollback to {tag_name}" > /home/pi/sre/watchdog_rollback.flag
+                        git -C /home/pi/sre reset --hard {tag_name} >> /home/pi/sre/watchdog.log 2>&1
+                        sudo /usr/bin/systemctl restart sre-daemon >> /home/pi/sre/watchdog.log 2>&1
+                        git -C /home/pi/sre tag -d {tag_name} >> /home/pi/sre/watchdog.log 2>&1
+                        curl -s -X POST "https://api.telegram.org/bot\${{TELEGRAM_BOT_TOKEN}}/sendMessage" \
+                          -d "chat_id=\${{TELEGRAM_CHAT_ID}}" \
+                          -d "text=⚠️ *SRE Watchdog*: Rollback tetiklendi! Servis stabilize olamadı, {tag_name} etiketine geri dönüldü." \
+                          > /dev/null 2>&1
+                      fi
+                    ) &"""
+
+                    # Pass credentials safely through environment variables
+                    env_pass = os.environ.copy()
+                    env_pass["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
+                    env_pass["TELEGRAM_CHAT_ID"] = TELEGRAM_CHAT_ID
+
+                    logger.info("Detached watchdog tetikleniyor...")
+                    subprocess.Popen(
+                        ["/bin/bash", "-c", watchdog_script],
+                        start_new_session=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=env_pass
+                    )
+
+                    # Trigger the restart of SRE Daemon
+                    logger.info("Daemon restart ediliyor...")
+                    subprocess.Popen(["sudo", "/usr/bin/systemctl", "restart", "sre-daemon"])
+                else:
+                    logger.warning("Tüm self-fix eylemleri başarılı olamadı, rollback yapılıyor...")
+                    subprocess.run(["git", "-C", "/home/pi/sre", "reset", "--hard", tag_name], capture_output=True)
+                    subprocess.run(["git", "-C", "/home/pi/sre", "tag", "-d", tag_name], capture_output=True)
+            return executed
+        finally:
+            if is_self_fix and SELF_FIX_LOCK.locked():
+                try:
+                    SELF_FIX_LOCK.release()
+                except RuntimeError:
+                    pass
 
     def _write_heal_log(self, error, fix, source, success, tag, actions=None):
         entry = {
@@ -670,38 +941,156 @@ class HealingOrchestrator:
         except OSError as e:
             logger.error("Heal log yazma hatası: %s", str(e))
 
+def run_approved_actions(actions: List[Dict[str, Any]], action_id: int):
+    orchestrator = HealingOrchestrator()
+    executed_status = orchestrator.execute_approved_actions(actions, action_id)
+    orchestrator._write_heal_log("HITL Approved Action ID: " + str(action_id), json.dumps(actions), "Telegram HITL", True, "[HITL-Fix]", executed_status)
 
-# ─────────────────────────────────────────────
-# Ana Daemon
-# ─────────────────────────────────────────────
+# ── Telegram Callback Polling Listener ───────────────────────
+def telegram_poller():
+    offset = None
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram Bot Token veya Chat ID eksik, poller pasif.")
+        return
+    
+    logger.info("Telegram Callback Poller aktif.")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"timeout": 30}
+            if offset:
+                params["offset"] = offset
+            
+            resp = requests.get(url, params=params, timeout=35)
+            if resp.status_code != 200:
+                time.sleep(5)
+                continue
+            
+            updates = resp.json().get("result", [])
+            for update in updates:
+                offset = update.get("update_id", 0) + 1
+                
+                callback_query = update.get("callback_query")
+                if callback_query:
+                    sender_chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
+                    if sender_chat_id != TELEGRAM_CHAT_ID:
+                        logger.warning("Güvenlik engeli: whitelist dışı chat_id: %s", sender_chat_id)
+                        continue
+                    
+                    callback_data = callback_query.get("data", "")
+                    callback_query_id = callback_query.get("id")
+                    message_id = callback_query.get("message", {}).get("message_id")
+                    
+                    # Answer immediately
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={
+                        "callback_query_id": callback_query_id
+                    }, timeout=5)
+                    
+                    if callback_data.startswith("approve_") or callback_data.startswith("reject_"):
+                        parts = callback_data.split("_")
+                        action = parts[0]
+                        action_id = int(parts[1])
+                        
+                        status = "approved" if action == "approve" else "rejected"
+                        actions = try_process_action(action_id, status)
+                        
+                        result_text = "✅ *Kabul Edildi & Uygulanıyor...*" if action == "approve" else "❌ *Reddedildi.*"
+                        original_text = callback_query.get("message", {}).get("text", "")
+                        edited_text = f"{original_text}\n\n{result_text}"
+                        
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
+                            "chat_id": sender_chat_id,
+                            "message_id": message_id,
+                            "text": edited_text,
+                            "parse_mode": "Markdown"
+                        }, timeout=5)
+                        
+                        if status == "rejected":
+                            # Add cooldown cache entry
+                            with ACTION_LOCK:
+                                init_db()
+                                with sqlite3.connect(DB_PATH) as conn:
+                                    conn.row_factory = sqlite3.Row
+                                    cur = conn.cursor()
+                                    cur.execute("SELECT error_hash FROM pending_actions WHERE id = ?", (action_id,))
+                                    r = cur.fetchone()
+                                    if r:
+                                        DECLINED_ERRORS[r["error_hash"]] = time.time()
+                        
+                        if actions:
+                            threading.Thread(
+                                target=run_approved_actions,
+                                args=(actions, action_id),
+                                daemon=True
+                            ).start()
+        except Exception as e:
+            logger.error("Telegram poller hatası: %s", str(e))
+            time.sleep(5)
+
+# ── Self-Improving Log Monitor ───────────────────────────────
+def start_self_monitor():
+    """Monitors daemon.log for exceptions and triggers self-fix loops."""
+    if not ANTHROPIC_KEY or not TELEGRAM_BOT_TOKEN:
+        return
+        
+    def _run():
+        log_path = Path("/home/pi/sre/daemon.log")
+        last_pos = 0
+        if log_path.exists():
+            last_pos = log_path.stat().st_size
+            
+        while True:
+            try:
+                if log_path.exists():
+                    curr_size = log_path.stat().st_size
+                    if curr_size > last_pos:
+                        with open(log_path, "r", errors="ignore") as f:
+                            f.seek(last_pos)
+                            content = f.read()
+                        last_pos = curr_size
+                        
+                        # Detect Traceback pattern
+                        if "Traceback (most recent call last)" in content or "[CRITICAL]" in content:
+                            logger.error("SRE Daemon internal error detected! Running self-diagnosis...")
+                            orchestrator = HealingOrchestrator()
+                            orchestrator.handle_error(content[-2000:], "[sre-daemon]")
+                time.sleep(10)
+            except Exception as e:
+                time.sleep(10)
+
+    threading.Thread(target=_run, name="self-monitor", daemon=True).start()
+
+# ── Main Loop ────────────────────────────────────────────────
 def main():
     logger.info("=" * 65)
-    logger.info("SRE Daemon v4 — Auto-Remediation Observer başlatılıyor...")
+    logger.info("SRE Daemon v5 — Hardened HITL & Self-Healing Engine başlatılıyor...")
     logger.info("Mac IP: %s", MAC_IP)
-    logger.info("Kaynaklar:")
-    logger.info("  📡 Systemd Journal  (journalctl -f -p err)")
-    logger.info("  🐳 Docker Events    (die / oom / kill)")
-    logger.info("Rate Limiter: %ds journal, %ds docker burst", RATE_LIMIT_SECONDS, DOCKER_BURST_LIMIT)
     logger.info("=" * 65)
 
     _validate_env()
-    Path(HEAL_LOG).parent.mkdir(parents=True, exist_ok=True)
+    init_db()
+    start_heartbeat()
+    cleanup_old_prefix_tags()
 
     rate_limiter = RateLimiter()
     orchestrator = HealingOrchestrator()
 
+    # Start watchers
     journal_watcher = JournalWatcher(rate_limiter, orchestrator.handle_error)
     docker_watcher  = DockerWatcher(rate_limiter, orchestrator.handle_error)
-
     journal_watcher.start()
     docker_watcher.start()
 
-    logger.info("Total System Observer aktif — Pi 5 tamamen izleniyor.")
+    # Start Telegram Poller, Timeout Worker, and Self-Monitor
+    threading.Thread(target=telegram_poller, name="telegram-poller", daemon=True).start()
+    threading.Thread(target=timeout_worker, name="timeout-worker", daemon=True).start()
+    start_self_monitor()
 
+    logger.info("Daemon active and observing Pi 5 metrics.")
     stop_event = threading.Event()
 
     def _shutdown(signum, frame):
-        logger.info("Kapatma sinyali (%s). Durduruluyor...", signum)
+        logger.info("Durduruluyor (sinyal: %s)...", signum)
         journal_watcher.stop()
         docker_watcher.stop()
         stop_event.set()
@@ -712,8 +1101,17 @@ def main():
     while not stop_event.is_set():
         stop_event.wait(timeout=60)
 
-    logger.info("SRE Daemon v3 durduruldu.")
+    logger.info("SRE Daemon durduruldu.")
 
+def _validate_env():
+    # Only critical env warnings
+    if not ANTHROPIC_KEY:
+        logger.warning("ANTHROPIC_API_KEY eksik, Claude eskalasyonu pasif.")
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("TELEGRAM_BOT_TOKEN eksik, bildirimler pasif.")
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        print("self-test-ok")
+        sys.exit(0)
     main()
