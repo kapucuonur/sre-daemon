@@ -120,21 +120,27 @@ sudo systemctl start sre-daemon
 
 ---
 
-## Future Roadmap & Vision
+## Future Roadmap & Vision (v6.0 Planning)
 
-We are evolving `sre-daemon` from a simple healing agent into a fully-featured **SRE ChatOps Platform**. Our goal is to balance full automation with surgical human control.
+We are evolving `sre-daemon` from a simple healing agent into a fully-featured **SRE ChatOps Platform**. Our goal is to balance full automation with surgical human control while keeping the Raspberry Pi 5 resource footprint near zero.
 
+### 🧠 v6.0 Memory & Rule Engine
+* **[Planned] Local Memory Cache (SQLite + difflib)**:
+  * Store a structured hash/signature of the traceback and its successful repair script in `sre_state.db`.
+  * Before calling any LLM, perform a local fuzzy search using Python's `difflib.SequenceMatcher` to find matching historical errors.
+  * If a successful fix is found, propose it directly to the user, bypassing LLM API latency and cost entirely.
+* **[Planned] Auto-Apply Safe Rules**:
+  * Implement a counter for repeatedly approved fixes.
+  * If a specific repair script is manually approved 5 times with 100% success rate, the daemon elevates it to "Auto-Apply", resolving the crash immediately without sending a Telegram prompt.
+
+### 📱 ChatOps & Visual Monitoring
 * **[Planned] Telegram Log Insight**:
-  * Dynamic integration of critical log snippets (last 10-20 lines) directly into the Telegram approval card.
-  * Allows immediate diagnosis from your phone without needing to SSH into the Pi.
+  * Dynamically integrate the last 15-20 lines of the crash log directly inside the Telegram alert card.
 * **[Planned] Interactive Human-in-the-Loop Patching**:
-  * Advanced approval workflow: If the AI-suggested patch needs a minor fix, you can reply to the Telegram bot with your edited version of the code.
-  * The daemon will validate your manual input, override the AI's proposal, and apply your verified code atomically.
-* **[Planned] Vector-Based Crash History (ChromaDB)**:
-  * Implement a long-term memory layer to store past crash signatures and successful repair patterns.
-  * The daemon will perform a lookup before calling an LLM, reducing latency and API costs for recurring issues.
-* **[Planned] "Circuit Breaker" Logic**:
-  * Automatically halt auto-remediation if a container exceeds a specific failure threshold (e.g., 3 crashes within 5 minutes), preventing "crash loops" and alerting the owner for a manual deep-dive.
+  * Advanced approval workflow allowing the user to reply to the Telegram bot with modifications to the proposed patch before clicking Approve.
+* **[Planned] Telegram-Native Visual Reports (`/stats`)**:
+  * To avoid hosting a heavy, resource-consuming web dashboard on the Pi 5, we will generate statistics charts using `matplotlib` locally and serve them directly as images on Telegram via a `/stats` command (e.g. daily/weekly SRE reports, cost savings, uptime metrics).
+
 
 ---
 
