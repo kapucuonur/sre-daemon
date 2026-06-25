@@ -8,6 +8,14 @@ https://github.com/user-attachments/assets/218de02b-4c89-4d2e-b764-8d0dbf694ddd
 
 ---
 
+## Key Concepts
+
+* **AI SRE (Site Reliability Engineer)**: An autonomous software agent that monitors system logs and Docker containers 24/7 to analyze and repair infrastructure issues automatically.
+* **Human-in-the-Loop (HITL)**: A safety gate pattern where the AI proposes a code patch or system change, but awaits explicit human confirmation (in our case, via interactive Telegram buttons) before executing it in production.
+* **Stateless Retries**: A reliable failover pattern where each fallback model in the stack is initialized with the original, raw error log. If a model fails or hallucinates, the next fallback starts with a clean slate, preventing the propagation of incorrect assumptions.
+
+---
+
 ## Architecture
 
 ```
