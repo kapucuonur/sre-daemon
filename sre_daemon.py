@@ -40,6 +40,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 LITELLM_API_KEY   = os.getenv("LITELLM_API_KEY", "")
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
+XAI_API_KEY       = os.getenv("XAI_API_KEY", "")
 
 DB_PATH           = Path("/home/pi/sre/sre_state.db")
 HEARTBEAT_PATH    = Path("/home/pi/sre/.heartbeat")
@@ -475,19 +476,13 @@ class GroqClient:
         if not GROQ_API_KEY:
             return None
         try:
-            if GROQ_API_KEY.startswith("xai-"):
-                url = "https://api.x.ai/v1/chat/completions"
-                model = "grok-2-1212"
-            else:
-                url = "https://api.groq.com/openai/v1/chat/completions"
-                model = "qwen-2.5-coder-32b"
-
+            url = "https://api.groq.com/openai/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json"
             }
             payload = {
-                "model": model,
+                "model": "llama-3.3-70b-versatile",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],
@@ -499,7 +494,33 @@ class GroqClient:
             text = res_json["choices"][0]["message"]["content"]
             return text.strip()
         except Exception as e:
-            logger.error("Groq/xAI API hatası: %s", str(e))
+            logger.error("Groq API hatası: %s", str(e))
+        return None
+
+class XAIClient:
+    def query(self, prompt: str) -> Optional[str]:
+        if not XAI_API_KEY:
+            return None
+        try:
+            url = "https://api.x.ai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {XAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "grok-2-1212",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            res_json = resp.json()
+            text = res_json["choices"][0]["message"]["content"]
+            return text.strip()
+        except Exception as e:
+            logger.error("xAI/Grok API hatası: %s", str(e))
         return None
 
 class AnthropicClient:
@@ -526,6 +547,7 @@ class HealingOrchestrator:
         self.ollama       = OllamaClient()
         self.gemini       = GeminiClient()
         self.groq         = GroqClient()
+        self.xai          = XAIClient()
         self.anthropic    = AnthropicClient()
 
     def handle_error(self, tagged_line: str, project_tag: str, err_hash: str):
@@ -612,13 +634,19 @@ class HealingOrchestrator:
             source = "gemini/gemini-2.5-flash"
             success = result is not None
 
-        # 3. Groq / xAI API (Free/Cheap tier)
+        # 3. Groq API (Free tier)
         if not success and GROQ_API_KEY:
             result = self.groq.query(prompt)
-            source = "groq-xai/grok-or-qwen"
+            source = "groq/llama-3.3-70b-versatile"
             success = result is not None
 
-        # 4. Local Pi Ollama (Offline fallback)
+        # 4. Grok (xAI) API (Cheap cloud fallback)
+        if not success and XAI_API_KEY:
+            result = self.xai.query(prompt)
+            source = "xai/grok-2-1212"
+            success = result is not None
+
+        # 5. Local Pi Ollama (Offline fallback)
         if not success:
             for attempt in range(1, MAX_LOCAL_TRIES + 1):
                 result = self.ollama.query(PI_OLLAMA_URL, "qwen2.5-coder:7b", prompt)
@@ -628,7 +656,7 @@ class HealingOrchestrator:
                     break
                 time.sleep(5 * attempt)
 
-        # 5. Anthropic Claude (Expensive cloud fallback)
+        # 6. Anthropic Claude (Expensive cloud fallback)
         if not success:
             result = self.anthropic.query(prompt)
             source = "anthropic/claude-sonnet-4-6"
