@@ -1,0 +1,33 @@
+[Unit]
+Description=Self-Healing SRE AI Daemon
+Documentation=https://github.com/onurkapucu/sre-daemon
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/sre
+
+# Güvenlik: Gizli anahtarlar servis dosyasında değil, ayrı .env'de
+EnvironmentFile=/home/pi/sre/.env
+
+ExecStart=/usr/bin/python3 /home/pi/sre/sre_daemon.py
+
+# Çökerse otomatik yeniden başlat (10 saniye bekle)
+Restart=always
+RestartSec=10
+
+# Standart output'u journald'a yönlendir (systemctl status ile görülebilir)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sre-daemon
+
+# Güvenlik sertleştirme (Pi kernel namespace desteklediği kadar)
+NoNewPrivileges=true
+# NOT: PrivateTmp ve ProtectSystem Pi 5 kernel'inde namespace hatasına yol açıyor — devre dışı
+# User=pi ile least-privilege sağlanıyor
+
+[Install]
+WantedBy=multi-user.target
