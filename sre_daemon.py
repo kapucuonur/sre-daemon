@@ -162,9 +162,96 @@ def init_db():
                     expires_at TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS heal_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    error_hash TEXT NOT NULL,
+                    error_message TEXT,
+                    project_tag TEXT,
+                    risk_level TEXT,
+                    llm_prompt_used TEXT,
+                    llm_response_raw TEXT,
+                    llm_source TEXT,
+                    actions_json TEXT,
+                    execution_output TEXT,
+                    success INTEGER,
+                    duration_seconds REAL,
+                    created_at TEXT
+                )
+            """)
+            # Default settings
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('autonomous_mode', '0')"
+            )
             conn.commit()
     except Exception as e:
         logger.error("SQLite init hatası: %s", str(e))
+
+def get_daemon_setting(key: str, default: str = "") -> str:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row[0] if row else default
+    except Exception:
+        return default
+
+def set_daemon_setting(key: str, value: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error("Setting yazma hatası: %s", str(e))
+
+def save_heal_history(
+    error_hash: str, error_message: str, project_tag: str, risk_level: str,
+    prompt: str, llm_response: str, llm_source: str,
+    actions: list, execution_output: list, success: bool, duration: float
+):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                INSERT INTO heal_history
+                (error_hash, error_message, project_tag, risk_level, llm_prompt_used,
+                 llm_response_raw, llm_source, actions_json, execution_output, success,
+                 duration_seconds, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                error_hash, error_message[:2000], project_tag, risk_level,
+                prompt[:4000], (llm_response or "")[:4000], llm_source,
+                json.dumps(actions), json.dumps(execution_output),
+                1 if success else 0, duration,
+                datetime.now(timezone.utc).isoformat()
+            ))
+            conn.commit()
+    except Exception as e:
+        logger.error("heal_history kayıt hatası: %s", str(e))
+
+def get_heal_history_for_hash(error_hash: str, limit: int = 10) -> list:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT actions_json, execution_output, success, created_at
+                FROM heal_history
+                WHERE error_hash = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (error_hash, limit))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
 
 def add_pending_action(error_hash: str, risk_level: str, actions: List[Dict[str, Any]]) -> int:
     init_db()
@@ -569,15 +656,36 @@ class HealingOrchestrator:
             name=f"healer-{project_tag}", daemon=True
         ).start()
 
-    def _build_prompt(self, tagged_line: str, project_tag: str) -> str:
+    def _build_prompt(self, tagged_line: str, project_tag: str, err_hash: str = None) -> str:
         project_name = project_tag.strip("[]")
+
+        # Reflexive Learning: inject past outcomes for this error hash
+        past_context = ""
+        if err_hash:
+            past = get_heal_history_for_hash(err_hash, limit=10)
+            if past:
+                past_context = "\n\nGEÇMİŞ ONARIM GİRİŞİMLERİ (Bu hata için önceki sonuçlar):\n"
+                for p in past:
+                    status_str = "BAŞARILI ✅" if p["success"] else "BAŞARISIZ ❌"
+                    try:
+                        acts = json.loads(p["actions_json"])
+                        act_summary = "; ".join(
+                            f"{a.get('type')} -> {a.get('target','?')} ({str(a.get('payload',''))[:60]})"
+                            for a in acts
+                        )
+                    except Exception:
+                        act_summary = p["actions_json"][:200]
+                    past_context += f"- [{p['created_at'][:16].replace('T', ' ')}] {status_str}: {act_summary}\n"
+                past_context += "\nYukarıdaki geçmiş sonuçları dikkate al. Başarısız olan aksiyonları tekrar deneme. Başarılı olanları tercih et.\n"
+
         return (
             f"Sen bir kıdemli Linux SRE ve backend geliştiricisisin.\n"
             f"Sistem: Raspberry Pi 5 | Proje/Servis: {project_name}\n\n"
             "Pi üzerindeki bilinen proje dizinleri ve docker-compose yolları şunlardır:\n"
             "- BikeFit-API (bikefit-api): Proje dizini: /home/pi/bikefit-api | docker-compose dizini: /home/pi/bikefit (docker-compose.yml burada yer alır)\n"
             "- AI-Coach (coachonurai-api): Proje dizini: /home/pi/projects/AI-Coach | docker-compose dizini: /home/pi/projects/AI-Coach (docker-compose.yml burada yer alır)\n"
-            "- TriHonor-API (trihonor-api-prod): Proje dizini: /home/pi/TriHonor-API | docker-compose dizini: /home/pi/TriHonor-API (docker-compose.prod.yml burada yer alır)\n\n"
+            "- TriHonor-API (trihonor-api-prod): Proje dizini: /home/pi/TriHonor-API | docker-compose dizini: /home/pi/TriHonor-API (docker-compose.prod.yml burada yer alır)\n"
+            f"{past_context}\n"
             "Aşağıdaki sistem hata mesajını analiz et:\n"
             "1. Kök nedeni açıkla (1-2 cümle)\n"
             "2. Tekrarlanmaması için önlem öner\n"
@@ -619,7 +727,9 @@ class HealingOrchestrator:
         return max_risk
 
     def _heal(self, tagged_line: str, project_tag: str, err_hash: str):
-        prompt = self._build_prompt(tagged_line, project_tag)
+        autonomous = get_daemon_setting("autonomous_mode", "0") == "1"
+        start_time = time.time()
+        prompt = self._build_prompt(tagged_line, project_tag, err_hash)
         result = None
         source = None
         success = False
@@ -678,20 +788,98 @@ class HealingOrchestrator:
                     cleaned = cleaned[:-3]
                 data = json.loads(cleaned.strip())
                 actions = data.get("actions", [])
-                
+
                 risk_level = self._classify_risk(actions)
-                logger.info("%s Analiz sonucu risk seviyesi: %s", project_tag, risk_level)
-                
-                if risk_level in ("Low", "Medium"):
-                    # Otonom çalıştır
+                logger.info("%s Analiz sonucu risk seviyesi: %s | Otonom mod: %s", project_tag, risk_level, autonomous)
+
+                if autonomous:
+                    # FULL AUTONOMOUS — bypass all risk checks
+                    send_telegram_text(
+                        TELEGRAM_CHAT_ID,
+                        f"🤖 *SRE Otonom İyileştirme*\n"
+                        f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                        f"⚡ *Risk*: `{md_escape(risk_level)}`\n"
+                        f"🔍 *Kök Neden*: {md_escape(data.get('root_cause', ''))}\n\n"
+                        f"Çözüm otonom uygulanıyor\\.\\.\\."
+                    )
                     executed_status = self.execute_approved_actions(actions, 0)
-                    self._write_heal_log(tagged_line, result, source, True, project_tag, executed_status)
+                    duration = time.time() - start_time
+                    all_ok = all(e.get("status") == "success" for e in executed_status)
+
+                    if all_ok:
+                        send_telegram_text(
+                            TELEGRAM_CHAT_ID,
+                            f"✅ *SRE Otonom İyileştirme Başarılı*\n"
+                            f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                            f"⏱ *Süre*: `{duration:.1f}s` | 🤖 *Kaynak*: `{md_escape(source)}`\n"
+                            f"Sorun çözüldü, servis stabilize edildi\\."
+                        )
+                    else:
+                        failed = [e for e in executed_status if e.get("status") != "success"]
+                        fail_summary = md_escape(json.dumps(failed, ensure_ascii=False)[:300])
+                        send_telegram_text(
+                            TELEGRAM_CHAT_ID,
+                            f"❌ *SRE Otonom İyileştirme Başarısız*\n"
+                            f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                            f"Bekçi köpeği geri yükleme yaptı\\!\n"
+                            f"Hata: `{fail_summary}`"
+                        )
+
+                    save_heal_history(
+                        error_hash=err_hash,
+                        error_message=tagged_line,
+                        project_tag=project_tag,
+                        risk_level=risk_level,
+                        prompt=prompt,
+                        llm_response=result,
+                        llm_source=source,
+                        actions=actions,
+                        execution_output=executed_status,
+                        success=all_ok,
+                        duration=duration
+                    )
+                    self._write_heal_log(tagged_line, result, source, all_ok, project_tag, executed_status)
+
+                elif risk_level in ("Low", "Medium"):
+                    # Non-autonomous but low/medium: still auto-execute
+                    executed_status = self.execute_approved_actions(actions, 0)
+                    duration = time.time() - start_time
+                    all_ok = all(e.get("status") == "success" for e in executed_status)
+                    save_heal_history(
+                        error_hash=err_hash,
+                        error_message=tagged_line,
+                        project_tag=project_tag,
+                        risk_level=risk_level,
+                        prompt=prompt,
+                        llm_response=result,
+                        llm_source=source,
+                        actions=actions,
+                        execution_output=executed_status,
+                        success=all_ok,
+                        duration=duration
+                    )
+                    self._write_heal_log(tagged_line, result, source, all_ok, project_tag, executed_status)
                 else:
-                    # HITL Telegram Onay Akışı
+                    # High/Critical + not autonomous → HITL Telegram approval
                     action_id = add_pending_action(err_hash, risk_level, actions)
                     self._send_approval_request(action_id, data, tagged_line, risk_level, project_tag)
+
             except Exception as e:
                 logger.error("Analiz parse hatası: %s", str(e))
+                duration = time.time() - start_time
+                save_heal_history(
+                    error_hash=err_hash,
+                    error_message=tagged_line,
+                    project_tag=project_tag,
+                    risk_level="unknown",
+                    prompt=prompt,
+                    llm_response=result,
+                    llm_source=source or "unknown",
+                    actions=[],
+                    execution_output=[{"error": str(e)}],
+                    success=False,
+                    duration=duration
+                )
                 self._write_heal_log(tagged_line, result, source, False, project_tag, [{"error": str(e)}])
 
     def _send_approval_request(self, action_id: int, data: dict, error_msg: str, risk: str, tag: str):
@@ -1100,11 +1288,46 @@ def telegram_poller():
                         if cmd == "/status":
                             status_msg = get_telegram_status_report()
                             send_telegram_text(chat_id, status_msg)
+                        elif cmd == "/autonomous":
+                            if len(cmd_parts) > 1:
+                                sub = cmd_parts[1].lower()
+                                if sub == "on":
+                                    set_daemon_setting("autonomous_mode", "1")
+                                    send_telegram_text(chat_id, "✅ *SRE Otonom Mod Aktif Edildi.*")
+                                elif sub == "off":
+                                    set_daemon_setting("autonomous_mode", "0")
+                                    send_telegram_text(chat_id, "❌ *SRE Otonom Mod Devre Dışı Bırakıldı.*")
+                                else:
+                                    send_telegram_text(chat_id, "Geçersiz parametre. Kullanım: `/autonomous on` veya `/autonomous off`")
+                            else:
+                                mode = get_daemon_setting("autonomous_mode", "0")
+                                status_label = "Açık (Otonom) 🤖" if mode == "1" else "Kapalı (Onay Bekler) 👥"
+                                send_telegram_text(chat_id, f"🤖 *SRE Otonom Mod Durumu*: `{status_label}`\n\nAçmak için: `/autonomous on`\nKapatmak için: `/autonomous off`")
+                        elif cmd == "/history":
+                            try:
+                                with sqlite3.connect(DB_PATH) as conn:
+                                    conn.row_factory = sqlite3.Row
+                                    cur = conn.cursor()
+                                    cur.execute("SELECT project_tag, success, duration_seconds, created_at FROM heal_history ORDER BY id DESC LIMIT 5")
+                                    rows = cur.fetchall()
+                                    if not rows:
+                                        send_telegram_text(chat_id, "📝 *Onarım geçmişi temiz.*")
+                                    else:
+                                        msg = "📊 *Son Onarım Girişimleri*:\n\n"
+                                        for r in rows:
+                                            status = "✅ Başarılı" if r["success"] else "❌ Başarısız"
+                                            dt = r["created_at"][:16].replace("T", " ")
+                                            msg += f"• *{md_escape(r['project_tag'])}* - {status} ({r['duration_seconds']:.1f}s) - _{dt}_\n"
+                                        send_telegram_text(chat_id, msg)
+                            except Exception as e:
+                                send_telegram_text(chat_id, f"Hata: {str(e)}")
                         elif cmd == "/help":
                             help_msg = (
                                 "🤖 *SRE Daemon Assistant*\n\n"
                                 "Mevcut komutlar:\n"
                                 "• `/status` - Sistem sağlığı, disk, RAM, sıcaklık ve konteyner durumlarını sorgular.\n"
+                                "• `/autonomous` - Otonom mod durumunu gösterir. (Kullanım: `/autonomous on` veya `/autonomous off`)\n"
+                                "• `/history` - Son onarım geçmişini gösterir.\n"
                                 "• `/help` - Bu yardım mesajını gösterir."
                             )
                             send_telegram_text(chat_id, help_msg)
