@@ -1,0 +1,19 @@
+[Unit]
+Description=SRE Journal-to-File Bridge
+Documentation=Feeds journald/Docker logs into file-based error logs for sre-daemon
+After=docker.service bikefit-api.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+ExecStart=/bin/bash /home/pi/sre/journal_to_file.sh
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sre-bridge
+
+[Install]
+WantedBy=multi-user.target
