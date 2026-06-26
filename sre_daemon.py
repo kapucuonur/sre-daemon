@@ -839,12 +839,52 @@ class HealingOrchestrator:
                         duration=duration
                     )
                     self._write_heal_log(tagged_line, result, source, all_ok, project_tag, executed_status)
+                    
+                    # Report to SRE platform central backend (Slack/Metrics)
+                    report_cmd = ""
+                    if actions:
+                        report_cmd = actions[0].get("payload", "") if actions[0].get("type") == "shell" else json.dumps(actions)
+                    report_incident_to_platform(
+                        service=project_tag,
+                        title=f"Autonomous Healing: {project_tag}",
+                        logs=tagged_line,
+                        status="resolved" if all_ok else "failed",
+                        proposed_command=report_cmd,
+                        action_output=json.dumps(executed_status)
+                    )
 
                 elif risk_level in ("Low", "Medium"):
                     # Non-autonomous but low/medium: still auto-execute
+                    send_telegram_text(
+                        TELEGRAM_CHAT_ID,
+                        f"🤖 *SRE İyileştirme (Düşük/Orta Risk)*\n"
+                        f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                        f"⚡ *Risk*: `{md_escape(risk_level)}`\n"
+                        f"🔍 *Kök Neden*: {md_escape(data.get('root_cause', ''))}\n\n"
+                        f"Çözüm otomatik uygulanıyor\\.\\.\\."
+                    )
                     executed_status = self.execute_approved_actions(actions, 0)
                     duration = time.time() - start_time
                     all_ok = all(e.get("status") == "success" for e in executed_status)
+                    
+                    if all_ok:
+                        send_telegram_text(
+                            TELEGRAM_CHAT_ID,
+                            f"✅ *SRE İyileştirme Başarılı*\n"
+                            f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                            f"⏱ *Süre*: `{duration:.1f}s` | 🤖 *Kaynak*: `{md_escape(source)}`\n"
+                            f"Sorun çözüldü, servis stabilize edildi\\."
+                        )
+                    else:
+                        failed = [e for e in executed_status if e.get("status") != "success"]
+                        fail_summary = md_escape(json.dumps(failed, ensure_ascii=False)[:300])
+                        send_telegram_text(
+                            TELEGRAM_CHAT_ID,
+                            f"❌ *SRE İyileştirme Başarısız*\n"
+                            f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                            f"Hata: `{fail_summary}`"
+                        )
+                        
                     save_heal_history(
                         error_hash=err_hash,
                         error_message=tagged_line,
@@ -859,6 +899,19 @@ class HealingOrchestrator:
                         duration=duration
                     )
                     self._write_heal_log(tagged_line, result, source, all_ok, project_tag, executed_status)
+                    
+                    # Report to SRE platform central backend (Slack/Metrics)
+                    report_cmd = ""
+                    if actions:
+                        report_cmd = actions[0].get("payload", "") if actions[0].get("type") == "shell" else json.dumps(actions)
+                    report_incident_to_platform(
+                        service=project_tag,
+                        title=f"Auto-remount Healing: {project_tag}",
+                        logs=tagged_line,
+                        status="resolved" if all_ok else "failed",
+                        proposed_command=report_cmd,
+                        action_output=json.dumps(executed_status)
+                    )
                 else:
                     # High/Critical + not autonomous → HITL Telegram approval
                     action_id = add_pending_action(err_hash, risk_level, actions)
@@ -1240,13 +1293,33 @@ def get_telegram_status_report() -> str:
 def send_telegram_text(chat_id: str, text: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
+        resp = requests.post(url, json={
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "Markdown"
         }, timeout=10)
+        if resp.status_code != 200:
+            logger.error("Telegram API hatası (kod: %d): %s", resp.status_code, resp.text)
+        resp.raise_for_status()
     except Exception as e:
         logger.error("Telegram mesajı gönderme hatası: %s", str(e))
+
+def report_incident_to_platform(service: str, title: str, logs: str, status: str, proposed_command: str, action_output: str):
+    try:
+        url = "http://localhost:8003/api/daemon/incident"
+        payload = {
+            "service": service.strip("[]"),
+            "title": title[:200],
+            "logs": logs[:2000],
+            "status": status,
+            "proposed_command": proposed_command,
+            "action_output": action_output
+        }
+        resp = requests.post(url, json=payload, timeout=5)
+        if resp.status_code != 200:
+            logger.warning("Platforma incident raporlanamadı (kod: %d): %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.warning("Platforma incident raporlama hatası: %s", str(e))
 
 # ── Telegram Callback Polling Listener ───────────────────────
 def telegram_poller():
