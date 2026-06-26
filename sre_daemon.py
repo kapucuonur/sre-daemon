@@ -974,6 +974,86 @@ def run_approved_actions(actions: List[Dict[str, Any]], action_id: int):
     executed_status = orchestrator.execute_approved_actions(actions, action_id)
     orchestrator._write_heal_log("HITL Approved Action ID: " + str(action_id), json.dumps(actions), "Telegram HITL", True, "[HITL-Fix]", executed_status)
 
+def get_telegram_status_report() -> str:
+    """Sistem sağlığı ve Docker durumlarını toplayıp Markdown rapor hazırlar."""
+    report = "📊 *SRE Daemon Sistem Durum Raporu*\n\n"
+    
+    # 1. CPU Temp
+    try:
+        temp_res = subprocess.run(["vcgencmd", "measure_temp"], capture_output=True, text=True, timeout=5)
+        temp = temp_res.stdout.strip().replace("temp=", "")
+        report += f"🌡️ *CPU Sıcaklığı*: `{temp}`\n"
+    except Exception:
+        report += "🌡️ *CPU Sıcaklığı*: `Bilinmiyor`\n"
+        
+    # 2. RAM Usage
+    try:
+        free_res = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
+        lines = free_res.stdout.splitlines()
+        mem_parts = lines[1].split()
+        total_mem = int(mem_parts[1])
+        used_mem = int(mem_parts[2])
+        mem_pct = (used_mem / total_mem) * 100
+        report += f"🧠 *Bellek (RAM)*: `{used_mem}MB / {total_mem}MB` (*{mem_pct:.1f}%*)\n"
+    except Exception:
+        report += "🧠 *Bellek (RAM)*: `Bilinmiyor`\n"
+        
+    # 3. Disk Usage
+    try:
+        df_res = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=5)
+        df_parts = df_res.stdout.splitlines()[-1].split()
+        disk_size = df_parts[1]
+        disk_used = df_parts[2]
+        disk_avail = df_parts[3]
+        disk_pct = df_parts[4]
+        report += f"💾 *Disk (Root)*: `{disk_used} / {disk_size}` (*{disk_pct}* free: `{disk_avail}`)\n\n"
+    except Exception:
+        report += "💾 *Disk (Root)*: `Bilinmiyor`\n\n"
+        
+    # 4. Active Docker Containers
+    try:
+        docker_res = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}|{{.Status}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        containers = docker_res.stdout.strip().splitlines()
+        if containers and containers[0]:
+            report += "🐳 *Aktif Konteynerler*:\n"
+            for c in containers:
+                parts = c.split("|")
+                name = parts[0]
+                status = parts[1]
+                status_short = status.split(" (")[0]
+                report += f"• `{name}`: _{status_short}_\n"
+        else:
+            report += "🐳 *Aktif Konteynerler*: `Yok veya Docker kapalı`\n"
+    except Exception as e:
+        report += f"🐳 *Docker Durumu*: `Hata: {str(e)}`\n"
+        
+    # 5. Pending approvals count
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT count(*) FROM pending_actions WHERE status = 'pending'")
+            count = cursor.fetchone()[0]
+            if count > 0:
+                report += f"\n🚨 *Onay Bekleyen Aksiyon*: `{count} adet`"
+    except Exception:
+        pass
+        
+    return report
+
+def send_telegram_text(chat_id: str, text: str):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+    except Exception as e:
+        logger.error("Telegram mesajı gönderme hatası: %s", str(e))
+
 # ── Telegram Callback Polling Listener ───────────────────────
 def telegram_poller():
     offset = None
@@ -998,6 +1078,32 @@ def telegram_poller():
             for update in updates:
                 offset = update.get("update_id", 0) + 1
                 
+                # 1. Handle Messages / Commands
+                message = update.get("message")
+                if message:
+                    chat_id = str(message.get("chat", {}).get("id", ""))
+                    if chat_id != TELEGRAM_CHAT_ID:
+                        logger.warning("Güvenlik engeli: whitelist dışı chat_id mesajı: %s", chat_id)
+                        continue
+                    
+                    text = message.get("text", "").strip()
+                    if text.startswith("/"):
+                        cmd_parts = text.split()
+                        cmd = cmd_parts[0].lower()
+                        
+                        if cmd == "/status":
+                            status_msg = get_telegram_status_report()
+                            send_telegram_text(chat_id, status_msg)
+                        elif cmd == "/help":
+                            help_msg = (
+                                "🤖 *SRE Daemon Assistant*\n\n"
+                                "Mevcut komutlar:\n"
+                                "• `/status` - Sistem sağlığı, disk, RAM, sıcaklık ve konteyner durumlarını sorgular.\n"
+                                "• `/help` - Bu yardım mesajını gösterir."
+                            )
+                            send_telegram_text(chat_id, help_msg)
+                
+                # 2. Handle Inline Buttons (Callback Queries)
                 callback_query = update.get("callback_query")
                 if callback_query:
                     sender_chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
