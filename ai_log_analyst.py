@@ -200,7 +200,12 @@ Analiz edilecek veriler:
 GÖREV:
 1. Kritik sorun var mı? (container çökmesi, disk dolması, yüksek hata oranı, güvenlik ihlali, sonsuz döngü, ödeme hatası vb.)
 2. Kullanıcı deneyimini etkileyen sorun var mı?
-3. Yakında sorun çıkarabilecek uyarı işaretleri var mı?
+3. Yakında sorun çıkarabilecek gerçek uyarı işaretleri var mı? (Örn: CPU sıcaklığı > 75°C, RAM/Disk kullanımı > 85%, çöken/sürekli yeniden başlayan container'lar, loglarda gerçek hata kayıtları).
+
+ÖNEMLİ KURALLAR:
+- Normal sistem metrikleri (CPU sıcaklığı < 75°C, Disk/RAM kullanımı < 85%, tüm container'ların çalışıyor/healthy olması ve loglarda hata bulunmaması) bir sorun VEYA uyarı işareti DEĞİLDİR. Bunları raporlama.
+- "Her şey normal görünüyor ama izlenmeli" veya "disk kullanımı düşük ama veri büyümesi izlenmeli" gibi durumlar için sorun üretme.
+- Eğer gerçek bir hata, çökme veya aşırı kaynak tüketimi (temp > 75°C, disk/ram > 85%) yoksa, SADECE "OK" cevabını ver.
 
 CEVAP FORMATI:
 - Eğer sorun YOKSA: sadece "OK" yaz, başka hiçbir şey yazma.
