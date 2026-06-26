@@ -368,7 +368,11 @@ def analyze_with_claude_api(prompt: str) -> tuple[bool, str]:
 
 def _parse_result(result: str) -> tuple[bool, str]:
     """Model çıktısını ayrıştır"""
-    if result.strip() == "OK":
+    clean_result = result.strip().strip("'\"`.").strip().upper()
+    if clean_result == "OK":
+        return False, ""
+    # Eğer çıktı içerisinde OK geçiyorsa ve herhangi bir hata emojisi (🚨 veya 💥) içermiyorsa sağlıklı kabul et
+    if "OK" in clean_result and "🚨" not in result and "💥" not in result:
         return False, ""
     return True, result
 
