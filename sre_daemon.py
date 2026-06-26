@@ -82,13 +82,15 @@ PROJECT_MAP = {
     "v4l":            "[Kernel-HW]",
 }
 
-# ── Logging ──────────────────────────────────────────────────
+log_dir = Path("/home/pi/sre")
+log_path = log_dir / "daemon.log" if log_dir.exists() else Path("daemon.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
     handlers=[
-        logging.FileHandler("/home/pi/sre/daemon.log"),
+        logging.FileHandler(str(log_path)),
         logging.StreamHandler(sys.stdout),
     ]
 )
@@ -550,7 +552,11 @@ class HealingOrchestrator:
         self.xai          = XAIClient()
         self.anthropic    = AnthropicClient()
 
-    def handle_error(self, tagged_line: str, project_tag: str, err_hash: str):
+    def handle_error(self, tagged_line: str, project_tag: str, err_hash: str = None):
+        if not err_hash:
+            import hashlib
+            err_hash = hashlib.md5(tagged_line.encode("utf-8", errors="ignore")).hexdigest()
+        
         # Cooldown / Dedup Check
         now = time.time()
         if err_hash in DECLINED_ERRORS:
@@ -893,7 +899,7 @@ class HealingOrchestrator:
                         return executed + [{"status": "failed", "error": f"git commit failed: {e}"}]
                     
                     # Detached Watchdog Spawning with MainPID and heartbeat checks
-                    watchdog_script = f"""(
+                    watchdog_script = fr"""(
                       sleep 10
                       PID1="\$(/usr/bin/systemctl show sre-daemon -p MainPID --value)"
                       ACTIVE1="\$(/usr/bin/systemctl is-active sre-daemon)"
