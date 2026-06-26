@@ -1051,8 +1051,11 @@ def telegram_poller():
                                 args=(actions, action_id),
                                 daemon=True
                             ).start()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            logger.warning("Telegram poller network/timeout warning (normal long-polling reset): %s", str(e))
+            time.sleep(2)
         except Exception as e:
-            logger.error("Telegram poller hatası: %s", str(e))
+            logger.error("Telegram poller beklenmedik hata: %s", str(e))
             time.sleep(5)
 
 # ── Self-Improving Log Monitor ───────────────────────────────
