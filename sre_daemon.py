@@ -1006,7 +1006,7 @@ def get_telegram_status_report() -> str:
         disk_used = df_parts[2]
         disk_avail = df_parts[3]
         disk_pct = df_parts[4]
-        report += f"💾 *Disk (Root)*: `{disk_used} / {disk_size}` (*{disk_pct}* free: `{disk_avail}`)\n\n"
+        report += f"💾 *Disk (Root)*: `{disk_used} / {disk_size}` (*{disk_pct}* used, `{disk_avail}` free)\n\n"
     except Exception:
         report += "💾 *Disk (Root)*: `Bilinmiyor`\n\n"
         
