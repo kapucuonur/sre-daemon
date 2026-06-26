@@ -100,7 +100,7 @@ logger = logging.getLogger("sre-daemon")
 def md_escape(text: str) -> str:
     if text is None:
         return ""
-    for ch in ["\\", "_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
+    for ch in ["\\", "_", "*", "`"]:
         text = text.replace(ch, f"\\{ch}")
     return text
 
