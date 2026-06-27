@@ -5,8 +5,10 @@ import pytest
 from unittest.mock import MagicMock, patch
 import time
 
+from pathlib import Path
+
 # Set test DB path before importing sre_daemon
-TEST_DB_PATH = "sre_state_test.db"
+TEST_DB_PATH = Path("sre_state_test.db")
 
 # Import sre-daemon module path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -71,3 +73,42 @@ def test_ollama_client_query():
         result = client.query("http://localhost:11434", "test-model", "test-prompt")
         assert result == "test ai output"
         mock_post.assert_called_once()
+
+def test_daemon_settings():
+    # Verify default setting
+    assert sre_daemon.get_daemon_setting("autonomous_mode", "0") == "0"
+    
+    # Verify modification
+    sre_daemon.set_daemon_setting("autonomous_mode", "1")
+    assert sre_daemon.get_daemon_setting("autonomous_mode", "0") == "1"
+
+def test_heal_history_and_prompt_injection():
+    # Save a test history record
+    sre_daemon.save_heal_history(
+        error_hash="test_hash_123",
+        error_message="critical database exception line 45",
+        project_tag="[Test-Servis]",
+        risk_level="High",
+        prompt="original prompt info",
+        llm_response="{}",
+        llm_source="mock-gemini",
+        actions=[{"type": "shell", "payload": "docker restart test"}],
+        execution_output=[{"status": "success"}],
+        success=True,
+        duration=1.5
+    )
+
+    # Retrieve history
+    history = sre_daemon.get_heal_history_for_hash("test_hash_123")
+    assert len(history) == 1
+    assert history[0]["success"] == 1
+    assert "test" in history[0]["actions_json"]
+
+    # Verify that build prompt injects the past history context
+    orchestrator = sre_daemon.HealingOrchestrator()
+    prompt = orchestrator._build_prompt("new error details", "[Test-Servis]", "test_hash_123")
+    
+    # The prompt should contain "GEÇMİŞ ONARIM GİRİŞİMLERİ" and mention success/actions
+    assert "GEÇMİŞ ONARIM GİRİŞİMLERİ" in prompt
+    assert "BAŞARILI" in prompt
+    assert "shell -> ? (docker restart test)" in prompt
