@@ -17,11 +17,12 @@ class DockerWatcher(BaseWatcher):
         "--format", "{{json .}}"
     ]
 
-    def __init__(self, rate_limiter, callback: Callable[[str, str], None], project_map: dict, docker_burst_limit: int = 3):
+    def __init__(self, rate_limiter, callback: Callable[[str, str], None], project_map: dict, docker_burst_limit: int = 3, register_service_cb: Optional[Callable[[str, str, bool], None]] = None):
         self.rate_limiter = rate_limiter
         self.callback = callback
         self.project_map = project_map
         self.docker_burst_limit = docker_burst_limit
+        self.register_service_cb = register_service_cb
         self._stop_event = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
 
@@ -72,10 +73,16 @@ class DockerWatcher(BaseWatcher):
 
         tag = "[Docker]"
         name_lower = container_name.lower()
+        found = False
         for keyword, mapped_tag in self.project_map.items():
             if keyword in name_lower:
                 tag = mapped_tag
+                found = True
                 break
+
+        if not found and container_name != "unknown" and self.register_service_cb:
+            tag = f"[{container_name.capitalize()}]"
+            self.register_service_cb(container_name, tag, True)
 
         rate_key = f"docker:{container_name}:{action}"
         if not self.rate_limiter.should_process(rate_key, self.docker_burst_limit):

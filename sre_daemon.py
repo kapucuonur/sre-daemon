@@ -312,6 +312,64 @@ def summarize_log(raw_msg: str) -> str:
 
     return "\n".join(summary_lines)
 
+# ── Self-Healing and Auto-discovery Helpers ──────────────────
+def register_discovered_service(service_name: str, tag: str, is_docker: bool = False):
+    """Autonomously registers a newly discovered service to config.json."""
+    try:
+        if service_name in PROJECT_MAP:
+            return
+
+        logger.info("New service discovered autonomously: %s -> %s", service_name, tag)
+        PROJECT_MAP[service_name] = tag
+
+        # Update config.json file
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+            
+            # Update project map
+            if "project_map" not in cfg:
+                cfg["project_map"] = {}
+            cfg["project_map"][service_name] = tag
+
+            # Update lists
+            if is_docker:
+                if "docker_containers" not in cfg:
+                    cfg["docker_containers"] = []
+                if service_name not in cfg["docker_containers"]:
+                    cfg["docker_containers"].append(service_name)
+            
+            # Atomic write
+            temp_path = CONFIG_PATH.with_suffix(".tmp")
+            with open(temp_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+            temp_path.replace(CONFIG_PATH)
+            logger.info("config.json has been autonomously updated.")
+    except Exception as e:
+        logger.error("Failed to autonomously update config.json: %s", e)
+
+def append_incident_to_graph_doc(service: str, title: str, status: str, proposed_command: str, success: bool):
+    """Appends incident details to sre_incidents.md to trigger graphify-watch updates."""
+    try:
+        incident_file = Path("/home/pi/sre/sre_incidents.md")
+        if not incident_file.parent.exists():
+            incident_file = Path("sre_incidents.md")
+        
+        now_str = datetime.now(timezone.utc).isoformat()
+        entry = (
+            f"\n## Incident: {title}\n"
+            f"- **Service**: {service}\n"
+            f"- **Status**: {status}\n"
+            f"- **Timestamp**: {now_str}\n"
+            f"- **Proposed Command**: `{proposed_command}`\n"
+            f"- **Success**: {success}\n"
+        )
+        with open(incident_file, "a") as f:
+            f.write(entry)
+        logger.info("Incident appended to graph document: %s", incident_file)
+    except Exception as e:
+        logger.error("Error appending incident to graph doc: %s", e)
+
 def save_heal_history(
     error_hash: str, error_message: str, project_tag: str, risk_level: str,
     prompt: str, llm_response: str, llm_source: str,
@@ -819,6 +877,13 @@ class HealingOrchestrator:
                         proposed_command=report_cmd,
                         action_output=json.dumps(executed_status)
                     )
+                    append_incident_to_graph_doc(
+                        service=project_tag,
+                        title=f"Autonomous Healing: {project_tag}",
+                        status="resolved" if all_ok else "failed",
+                        proposed_command=report_cmd,
+                        success=all_ok
+                    )
 
                 elif risk_level in ("Low", "Medium"):
                     # Non-autonomous but low/medium: still auto-execute
@@ -878,6 +943,13 @@ class HealingOrchestrator:
                         status="resolved" if all_ok else "failed",
                         proposed_command=report_cmd,
                         action_output=json.dumps(executed_status)
+                    )
+                    append_incident_to_graph_doc(
+                        service=project_tag,
+                        title=f"Auto-remount Healing: {project_tag}",
+                        status="resolved" if all_ok else "failed",
+                        proposed_command=report_cmd,
+                        success=all_ok
                     )
                 else:
                     # High/Critical + not autonomous → HITL Telegram approval
@@ -1482,8 +1554,8 @@ def main():
     orchestrator = HealingOrchestrator()
 
     # Start watchers
-    journal_watcher = JournalWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, NOISE_PATTERNS)
-    docker_watcher  = DockerWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, DOCKER_BURST_LIMIT)
+    journal_watcher = JournalWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, NOISE_PATTERNS, register_discovered_service)
+    docker_watcher  = DockerWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, DOCKER_BURST_LIMIT, register_discovered_service)
     journal_watcher.start()
     docker_watcher.start()
 

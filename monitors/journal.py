@@ -15,11 +15,12 @@ class JournalWatcher(BaseWatcher):
         "--no-pager", "--no-hostname"
     ]
 
-    def __init__(self, rate_limiter, callback: Callable[[str, str], None], project_map: dict, noise_patterns_regex: re.Pattern):
+    def __init__(self, rate_limiter, callback: Callable[[str, str], None], project_map: dict, noise_patterns_regex: re.Pattern, register_service_cb: Optional[Callable[[str, str, bool], None]] = None):
         self.rate_limiter = rate_limiter
         self.callback = callback
         self.project_map = project_map
         self.noise_patterns = noise_patterns_regex
+        self.register_service_cb = register_service_cb
         self._stop_event = threading.Event()
         self._proc: Optional[subprocess.Popen] = None
 
@@ -78,10 +79,17 @@ class JournalWatcher(BaseWatcher):
         # Derive project tag
         combined = f"{unit} {ident} {safe_msg}".lower()
         tag = "[System]"
+        found = False
         for keyword, mapped_tag in self.project_map.items():
             if keyword in combined:
                 tag = mapped_tag
+                found = True
                 break
+
+        if not found and unit != "-" and self.register_service_cb:
+            clean_unit = unit.split(".")[0]
+            tag = f"[{clean_unit.capitalize()}]"
+            self.register_service_cb(clean_unit, tag, False)
 
         rate_key = f"journal:{unit}:{safe_msg[:80]}"
         if not self.rate_limiter.should_process(rate_key):
