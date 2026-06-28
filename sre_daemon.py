@@ -1560,7 +1560,8 @@ def send_telegram_text(chat_id: str, text: str):
 
 def report_incident_to_platform(service: str, title: str, logs: str, status: str, proposed_command: str, action_output: str):
     try:
-        url = "http://localhost:8003/api/daemon/incident"
+        platform_url = os.getenv("SRE_PLATFORM_URL", "http://localhost:8003")
+        url = f"{platform_url.rstrip('/')}/api/daemon/incident"
         payload = {
             "service": service.strip("[]"),
             "title": title[:200],
@@ -1569,7 +1570,12 @@ def report_incident_to_platform(service: str, title: str, logs: str, status: str
             "proposed_command": proposed_command,
             "action_output": action_output
         }
-        resp = requests.post(url, json=payload, timeout=5)
+        headers = {}
+        api_key = os.getenv("SRE_API_KEY")
+        if api_key:
+            headers["X-SRE-API-Key"] = api_key
+            
+        resp = requests.post(url, json=payload, headers=headers, timeout=5)
         if resp.status_code != 200:
             logger.warning("Platforma incident raporlanamadı (kod: %d): %s", resp.status_code, resp.text)
     except Exception as e:
