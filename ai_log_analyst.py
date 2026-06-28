@@ -50,22 +50,109 @@ OLLAMA_MODEL      = "qwen2.5-coder:7b"
 LITELLM_URL       = "http://localhost:4000/v1/chat/completions"
 LITELLM_API_KEY   = os.getenv("LITELLM_API_KEY", "sk-1234")  # LiteLLM proxy key
 
-# İzlenecek log dosyaları
-LOG_FILES = [
+# Dynamic Config Loading
+import sqlite3
+DB_PATH = Path("/home/pi/sre/sre_state.db")
+CONFIG_PATH = Path(__file__).parent / "config.json"
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading config.json: {e}")
+    return {}
+
+_config = load_config()
+
+LOG_FILES = _config.get("log_files", [
     "/home/pi/bikefit-api/logs/analytics.jsonl",
     "/home/pi/bikefit-api/logs/frontend_errors.jsonl",
     "/home/pi/bikefit-api/logs/error.log",
     "/home/pi/sre/daemon.log",
-]
+])
 
-# İzlenecek Docker containerları
-DOCKER_CONTAINERS = [
+DOCKER_CONTAINERS = _config.get("docker_containers", [
     "bikefit-api",
     "bikefit-frontend",
     "coachonurai-api",
     "trihonor-api-prod",
     "vaultwarden",
-]
+])
+
+DAILY_CLOUD_LIMITS = _config.get("daily_cloud_api_limit", {
+    "gemini": 100,
+    "groq": 100,
+    "xai": 50,
+    "claude": 5
+})
+
+# ── Daily call tracking helpers ──────────────────────────────
+def get_daily_calls(model_provider: str) -> int:
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS daily_api_usage (provider TEXT, day TEXT, count INTEGER, PRIMARY KEY (provider, day))"
+            )
+            cur.execute(
+                "SELECT count FROM daily_api_usage WHERE provider = ? AND day = ?",
+                (model_provider, today_str)
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        print(f"Token budget check error: {e}")
+        return 0
+
+def increment_daily_calls(model_provider: str):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS daily_api_usage (provider TEXT, day TEXT, count INTEGER, PRIMARY KEY (provider, day))"
+            )
+            conn.execute(
+                "INSERT INTO daily_api_usage (provider, day, count) VALUES (?, ?, 1) "
+                "ON CONFLICT(provider, day) DO UPDATE SET count = count + 1",
+                (model_provider, today_str)
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Token budget update error: {e}")
+
+def summarize_log(raw_msg: str) -> str:
+    """Pre-processes and summarizes logs to reduce tokens sent to LLM."""
+    if not raw_msg or len(raw_msg) < 500:
+        return raw_msg
+
+    lines = raw_msg.splitlines()
+    if len(lines) <= 6:
+        return raw_msg
+
+    error_indicators = ["error", "exception", "failed", "traceback", "critical", "fatal"]
+    critical_lines = []
+    for i, line in enumerate(lines):
+        if any(ind in line.lower() for ind in error_indicators):
+            critical_lines.append((i, line))
+
+    summary_lines = []
+    summary_lines.append(f"[Start of Log Excerpt] {lines[0]}")
+
+    added_indices = {0}
+    for idx, line in critical_lines[:3]:
+        for neighbor in range(max(0, idx - 1), min(len(lines), idx + 2)):
+            if neighbor not in added_indices:
+                summary_lines.append(f"Line {neighbor + 1}: {lines[neighbor]}")
+                added_indices.add(neighbor)
+
+    summary_lines.append("... [truncated intermediate lines] ...")
+    for idx in range(max(0, len(lines) - 3), len(lines)):
+        if idx not in added_indices:
+            summary_lines.append(f"Line {idx + 1}: {lines[idx]}")
+
+    return "\n".join(summary_lines)
 
 # ── Yardımcı Fonksiyonlar ─────────────────────────────────────
 
@@ -168,7 +255,7 @@ def collect_all_data(state: dict) -> dict:
     for container in DOCKER_CONTAINERS:
         logs = get_docker_logs(container, LOG_WINDOW_MINUTES)
         if logs:
-            data["docker_logs"][container] = logs[-3000:]  # Son 3000 karakter
+            data["docker_logs"][container] = summarize_log(logs[-3000:])  # Özetlenmiş loglar
 
     # Uygulama log dosyaları
     new_positions = state.get("last_log_positions", {})
@@ -177,7 +264,7 @@ def collect_all_data(state: dict) -> dict:
         content, new_pos = read_recent_log_lines(log_file, last_pos)
         new_positions[log_file] = new_pos
         if content:
-            data["app_logs"][log_file] = content[-3000:]
+            data["app_logs"][log_file] = summarize_log(content[-3000:])  # Özetlenmiş loglar
 
     state["last_log_positions"] = new_positions
     return data
@@ -384,18 +471,29 @@ def analyze(data: dict) -> tuple[bool, str]:
     """
     prompt = build_prompt(data)
 
+    def run_with_budget(provider_name: str, query_fn) -> tuple[Optional[bool], Optional[str]]:
+        limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
+        current = get_daily_calls(provider_name)
+        if current >= limit:
+            print(f"⚠️ Daily API budget exceeded for {provider_name} ({current}/{limit} calls). Skipping.")
+            return None, None
+        has_prob, rep = query_fn()
+        if has_prob is not None:
+            increment_daily_calls(provider_name)
+        return has_prob, rep
+
     # 1. Gemini
-    has_problem, report = analyze_with_gemini(prompt)
+    has_problem, report = run_with_budget("gemini", lambda: analyze_with_gemini(prompt))
     if has_problem is not None:
         return has_problem, report
 
     # 2. Groq
-    has_problem, report = analyze_with_groq(prompt)
+    has_problem, report = run_with_budget("groq", lambda: analyze_with_groq(prompt))
     if has_problem is not None:
         return has_problem, report
 
     # 3. Grok (xAI)
-    has_problem, report = analyze_with_xai(prompt)
+    has_problem, report = run_with_budget("xai", lambda: analyze_with_xai(prompt))
     if has_problem is not None:
         return has_problem, report
 
@@ -409,8 +507,17 @@ def analyze(data: dict) -> tuple[bool, str]:
     if has_problem is not None:
         return has_problem, report
 
-    # 5. Claude API (son çare)
-    return analyze_with_claude_api(prompt)
+    # 6. Claude API (son çare)
+    limit = DAILY_CLOUD_LIMITS.get("claude", 99999)
+    current = get_daily_calls("claude")
+    if current >= limit:
+        print(f"⚠️ Daily API budget exceeded for claude ({current}/{limit} calls). Skipping.")
+        return True, "⚠️ Claude API limit reached, analysis fell back to local."
+
+    has_problem, report = analyze_with_claude_api(prompt)
+    if has_problem is not None:
+        increment_daily_calls("claude")
+    return has_problem, report
 
 def send_telegram(message: str):
     """Telegram'a bildirim gönder"""

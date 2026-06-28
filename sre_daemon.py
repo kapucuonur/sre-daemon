@@ -49,22 +49,30 @@ MAX_LOCAL_TRIES   = 3
 OLLAMA_TIMEOUT    = 60
 ANTHROPIC_TIMEOUT = 60
 RATE_LIMIT_SECONDS = 600
-DOCKER_BURST_LIMIT = 60
 
 # Locks & Cooldown Cache
 ACTION_LOCK       = threading.Lock()
 SELF_FIX_LOCK     = threading.Lock()
 DECLINED_ERRORS   = {}  # error_hash -> timestamp
-DECLINED_COOLDOWN = 3600  # 1 hour cooldown for rejected issues
+TRUCE_CACHE       = {}  # error_hash -> (timestamp, count)
 
-NOISE_PATTERNS = re.compile(
-    r"(DEBUG|audit\(|systemd-logind|NetworkManager.*state|"
-    r"DHCP|avahi|dbus-daemon|Bluetooth|btusb|rfkill|"
-    r"CRON|anacron|logrotate|sre-daemon|sre-bridge)",
-    re.IGNORECASE
-)
+# Dynamic Config Loading
+CONFIG_PATH = Path(__file__).parent / "config.json"
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading config.json: {e}")
+    return {}
 
-PROJECT_MAP = {
+_config = load_config()
+
+NOISE_PATTERNS_STR = _config.get("noise_patterns", r"(DEBUG|audit\(|systemd-logind|NetworkManager.*state|DHCP|avahi|dbus-daemon|Bluetooth|btusb|rfkill|CRON|anacron|logrotate|sre-daemon|sre-bridge)")
+NOISE_PATTERNS = re.compile(NOISE_PATTERNS_STR, re.IGNORECASE)
+
+PROJECT_MAP = _config.get("project_map", {
     "trihonor":       "[TriHonor-API]",
     "coachonurai":    "[AI-Coach]",
     "bikefit-api":    "[BikeFit-API]",
@@ -80,7 +88,29 @@ PROJECT_MAP = {
     "usb":            "[Kernel-HW]",
     "camera":         "[Kernel-HW]",
     "v4l":            "[Kernel-HW]",
-}
+})
+DOCKER_BURST_LIMIT = _config.get("docker_burst_limit", 3)
+DECLINED_COOLDOWN = _config.get("declined_cooldown", 3600)
+TRUCE_COOLDOWN_SECONDS = _config.get("truce_cooldown_seconds", 600)
+DAILY_CLOUD_LIMITS = _config.get("daily_cloud_api_limit", {
+    "gemini": 100,
+    "groq": 100,
+    "xai": 50,
+    "claude": 5
+})
+
+# Import Watchers dynamically
+try:
+    from monitors import JournalWatcher, DockerWatcher
+except ImportError:
+    class JournalWatcher:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+        def stop(self): pass
+    class DockerWatcher:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+        def stop(self): pass
 
 log_dir = Path("/home/pi/sre")
 log_path = log_dir / "daemon.log" if log_dir.exists() else Path("daemon.log")
@@ -185,6 +215,14 @@ def init_db():
                     created_at TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_api_usage (
+                    provider TEXT,
+                    day TEXT,
+                    count INTEGER,
+                    PRIMARY KEY (provider, day)
+                )
+            """)
             # Default settings
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES ('autonomous_mode', '0')"
@@ -212,6 +250,67 @@ def set_daemon_setting(key: str, value: str):
             conn.commit()
     except Exception as e:
         logger.error("Setting yazma hatası: %s", str(e))
+
+# ── Token Minimization Helpers ───────────────────────────────
+def get_daily_calls(model_provider: str) -> int:
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT count FROM daily_api_usage WHERE provider = ? AND day = ?",
+                (model_provider, today_str)
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        logger.error("Token budget check error: %s", e)
+        return 0
+
+def increment_daily_calls(model_provider: str):
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO daily_api_usage (provider, day, count) VALUES (?, ?, 1) "
+                "ON CONFLICT(provider, day) DO UPDATE SET count = count + 1",
+                (model_provider, today_str)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error("Token budget update error: %s", e)
+
+def summarize_log(raw_msg: str) -> str:
+    """Pre-processes and summarizes logs to reduce tokens sent to LLM."""
+    if not raw_msg or len(raw_msg) < 500:
+        return raw_msg
+
+    lines = raw_msg.splitlines()
+    if len(lines) <= 6:
+        return raw_msg
+
+    error_indicators = ["error", "exception", "failed", "traceback", "critical", "fatal"]
+    critical_lines = []
+    for i, line in enumerate(lines):
+        if any(ind in line.lower() for ind in error_indicators):
+            critical_lines.append((i, line))
+
+    summary_lines = []
+    summary_lines.append(f"[Start of Log Excerpt] {lines[0]}")
+
+    added_indices = {0}
+    for idx, line in critical_lines[:3]:
+        for neighbor in range(max(0, idx - 1), min(len(lines), idx + 2)):
+            if neighbor not in added_indices:
+                summary_lines.append(f"Line {neighbor + 1}: {lines[neighbor]}")
+                added_indices.add(neighbor)
+
+    summary_lines.append("... [truncated intermediate lines] ...")
+    for idx in range(max(0, len(lines) - 3), len(lines)):
+        if idx not in added_indices:
+            summary_lines.append(f"Line {idx + 1}: {lines[idx]}")
+
+    return "\n".join(summary_lines)
 
 def save_heal_history(
     error_hash: str, error_message: str, project_tag: str, risk_level: str,
@@ -347,167 +446,7 @@ class RateLimiter:
             return True
 
 # ── Watchers ─────────────────────────────────────────────────
-class JournalWatcher:
-    JOURNAL_CMD = [
-        "journalctl", "-f", "-n", "0", "-p", "err", "-o", "json",
-        "--no-pager", "--no-hostname"
-    ]
-
-    def __init__(self, rate_limiter: RateLimiter, callback):
-        self.rate_limiter = rate_limiter
-        self.callback = callback
-        self._stop_event = threading.Event()
-        self._proc: Optional[subprocess.Popen] = None
-
-    def start(self):
-        threading.Thread(target=self._watch, name="journal-watcher", daemon=True).start()
-        logger.info("JournalWatcher aktif.")
-
-    def stop(self):
-        self._stop_event.set()
-        if self._proc:
-            try:
-                self._proc.terminate()
-            except OSError:
-                pass
-
-    def _watch(self):
-        while not self._stop_event.is_set():
-            try:
-                self._proc = subprocess.Popen(
-                    self.JOURNAL_CMD,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    bufsize=1,
-                )
-                for raw_line in self._proc.stdout:
-                    if self._stop_event.is_set():
-                        break
-                    self._process_line(raw_line.strip())
-            except Exception as e:
-                logger.error("JournalWatcher hata: %s", str(e))
-                time.sleep(10)
-
-    def _process_line(self, raw_line: str):
-        if not raw_line:
-            return
-        try:
-            entry = json.loads(raw_line)
-        except json.JSONDecodeError:
-            return
-
-        message   = entry.get("MESSAGE", "")
-        unit      = entry.get("_SYSTEMD_UNIT", "-")
-        ident     = entry.get("SYSLOG_IDENTIFIER", "-")
-        priority  = int(entry.get("PRIORITY", 6))
-
-        if priority > 3:
-            return
-        if NOISE_PATTERNS.search(f"{unit} {ident} {message}"):
-            return
-
-        safe_msg = str(message)[:2000]
-        if not safe_msg:
-            return
-
-        # Derive project tag
-        combined = f"{unit} {ident} {safe_msg}".lower()
-        tag = "[System]"
-        for keyword, mapped_tag in PROJECT_MAP.items():
-            if keyword in combined:
-                tag = mapped_tag
-                break
-
-        rate_key = f"journal:{unit}:{safe_msg[:80]}"
-        if not self.rate_limiter.should_process(rate_key):
-            return
-
-        priority_label = {0: "EMERG", 1: "ALERT", 2: "CRIT", 3: "ERR"}.get(priority, "ERR")
-        tagged = f"{tag} [{priority_label}][{ident}] {safe_msg}"
-        self.callback(tagged, tag)
-
-class DockerWatcher:
-    CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
-    DOCKER_EVENTS_CMD = [
-        "docker", "events", "--filter", "type=container",
-        "--filter", "event=die", "--filter", "event=oom", "--filter", "event=kill",
-        "--format", "{{json .}}"
-    ]
-
-    def __init__(self, rate_limiter: RateLimiter, callback):
-        self.rate_limiter = rate_limiter
-        self.callback = callback
-        self._stop_event = threading.Event()
-        self._proc: Optional[subprocess.Popen] = None
-
-    def start(self):
-        threading.Thread(target=self._watch, name="docker-watcher", daemon=True).start()
-        logger.info("DockerWatcher aktif.")
-
-    def stop(self):
-        self._stop_event.set()
-        if self._proc:
-            try:
-                self._proc.terminate()
-            except OSError:
-                pass
-
-    def _watch(self):
-        while not self._stop_event.is_set():
-            try:
-                self._proc = subprocess.Popen(
-                    self.DOCKER_EVENTS_CMD,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    bufsize=1,
-                )
-                for raw_line in self._proc.stdout:
-                    if self._stop_event.is_set():
-                        break
-                    self._process_event(raw_line.strip())
-            except Exception as e:
-                logger.error("DockerWatcher hata: %s", str(e))
-                time.sleep(15)
-
-    def _process_event(self, raw_line: str):
-        if not raw_line:
-            return
-        try:
-            event = json.loads(raw_line)
-        except json.JSONDecodeError:
-            return
-
-        container_id   = event.get("id", "")
-        container_name = event.get("Actor", {}).get("Attributes", {}).get("name", "unknown")
-        action         = event.get("Action", "die")
-
-        if not self.CONTAINER_ID_RE.match(container_id):
-            return
-
-        tag = "[Docker]"
-        name_lower = container_name.lower()
-        for keyword, mapped_tag in PROJECT_MAP.items():
-            if keyword in name_lower:
-                tag = mapped_tag
-                break
-
-        rate_key = f"docker:{container_name}:{action}"
-        if not self.rate_limiter.should_process(rate_key, DOCKER_BURST_LIMIT):
-            return
-
-        # Fetch logs
-        try:
-            res = subprocess.run(["docker", "logs", "--tail", "30", container_id], capture_output=True, text=True, timeout=10)
-            logs = (res.stdout + res.stderr).strip()
-            error_lines = [l for l in logs.splitlines() if re.search(r"error|exception|traceback|fatal|fail", l, re.IGNORECASE)]
-            log_summary = "\n".join(error_lines[-20:]) if error_lines else logs[-1000:]
-        except Exception as e:
-            log_summary = f"Log hatası: {str(e)}"
-
-        tagged = f"{tag} [DOCKER-{action.upper()}] Container '{container_name}' çöktü.\nSon loglar:\n{log_summary}"
-        self.callback(tagged, tag)
+# Loaded dynamically from the monitors module at runtime.
 
 # ── Clients ──────────────────────────────────────────────────
 class MacChecker:
@@ -651,6 +590,17 @@ class HealingOrchestrator:
                 logger.info("Aynı hata son 1 saatte reddedilmiş, yoksayılıyor: %s", project_tag)
                 return
 
+        # Truce (Ateşkes) Cooldown Check
+        if err_hash in TRUCE_CACHE:
+            last_time, count = TRUCE_CACHE[err_hash]
+            if now - last_time < TRUCE_COOLDOWN_SECONDS:
+                TRUCE_CACHE[err_hash] = (last_time, count + 1)
+                logger.info("Truce (Ateşkes) aktif: Hata '%s' son %d saniyede zaten inceleniyor. Tekrarlama adedi: %d", project_tag, TRUCE_COOLDOWN_SECONDS, count + 1)
+                return
+        
+        # Register in Truce cache
+        TRUCE_CACHE[err_hash] = (now, 1)
+
         threading.Thread(
             target=self._heal, args=(tagged_line, project_tag, err_hash),
             name=f"healer-{project_tag}", daemon=True
@@ -729,11 +679,16 @@ class HealingOrchestrator:
     def _heal(self, tagged_line: str, project_tag: str, err_hash: str):
         autonomous = get_daemon_setting("autonomous_mode", "0") == "1"
         start_time = time.time()
-        prompt = self._build_prompt(tagged_line, project_tag, err_hash)
+        
+        # Token Minimization: Summarize log
+        summarized_line = summarize_log(tagged_line)
+        prompt = self._build_prompt(summarized_line, project_tag, err_hash)
+        
         result = None
         source = None
         success = False
 
+        # 1. Local Mac Ollama (if online)
         mac_online = self.mac_checker.is_mac_online()
         if mac_online:
             for attempt in range(1, MAX_LOCAL_TRIES + 1):
@@ -744,21 +699,33 @@ class HealingOrchestrator:
                     break
                 time.sleep(5 * attempt)
 
+        # Budget helper
+        def run_with_budget(provider_name: str, query_fn) -> Optional[str]:
+            limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
+            current = get_daily_calls(provider_name)
+            if current >= limit:
+                logger.warning("Daily API budget exceeded for %s (%d/%d calls). Skipping.", provider_name, current, limit)
+                return None
+            res = query_fn()
+            if res is not None:
+                increment_daily_calls(provider_name)
+            return res
+
         # 2. Google Gemini API (Free tier)
         if not success and GEMINI_API_KEY:
-            result = self.gemini.query(prompt)
+            result = run_with_budget("gemini", lambda: self.gemini.query(prompt))
             source = "gemini/gemini-2.5-flash"
             success = result is not None
 
         # 3. Groq API (Free tier)
         if not success and GROQ_API_KEY:
-            result = self.groq.query(prompt)
+            result = run_with_budget("groq", lambda: self.groq.query(prompt))
             source = "groq/llama-3.3-70b-versatile"
             success = result is not None
 
         # 4. Grok (xAI) API (Cheap cloud fallback)
         if not success and XAI_API_KEY:
-            result = self.xai.query(prompt)
+            result = run_with_budget("xai", lambda: self.xai.query(prompt))
             source = "xai/grok-2-1212"
             success = result is not None
 
@@ -773,8 +740,8 @@ class HealingOrchestrator:
                 time.sleep(5 * attempt)
 
         # 6. Anthropic Claude (Expensive cloud fallback)
-        if not success:
-            result = self.anthropic.query(prompt)
+        if not success and ANTHROPIC_KEY:
+            result = run_with_budget("claude", lambda: self.anthropic.query(prompt))
             source = "anthropic/claude-sonnet-4-6"
             success = result is not None
 
@@ -1515,8 +1482,8 @@ def main():
     orchestrator = HealingOrchestrator()
 
     # Start watchers
-    journal_watcher = JournalWatcher(rate_limiter, orchestrator.handle_error)
-    docker_watcher  = DockerWatcher(rate_limiter, orchestrator.handle_error)
+    journal_watcher = JournalWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, NOISE_PATTERNS)
+    docker_watcher  = DockerWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, DOCKER_BURST_LIMIT)
     journal_watcher.start()
     docker_watcher.start()
 

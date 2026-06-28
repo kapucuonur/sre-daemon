@@ -1,0 +1,44 @@
+{
+  "noise_patterns": "(DEBUG|audit\\(|systemd-logind|NetworkManager.*state|DHCP|avahi|dbus-daemon|Bluetooth|btusb|rfkill|CRON|anacron|logrotate|sre-daemon|sre-bridge)",
+  "project_map": {
+    "trihonor": "[TriHonor-API]",
+    "coachonurai": "[AI-Coach]",
+    "bikefit-api": "[BikeFit-API]",
+    "bikefit": "[BikeFit-API]",
+    "ai-sre": "[SRE-Platform]",
+    "sre-platform": "[SRE-Platform]",
+    "nginx": "[Nginx]",
+    "postgres": "[PostgreSQL]",
+    "immich": "[Immich]",
+    "vaultwarden": "[Vaultwarden]",
+    "hailo": "[Hailo-AI-HW]",
+    "hailort": "[Hailo-AI-HW]",
+    "docker": "[Docker-Engine]",
+    "kernel": "[Kernel-HW]",
+    "usb": "[Kernel-HW]",
+    "camera": "[Kernel-HW]",
+    "v4l": "[Kernel-HW]"
+  },
+  "log_files": [
+    "/home/pi/bikefit-api/logs/analytics.jsonl",
+    "/home/pi/bikefit-api/logs/frontend_errors.jsonl",
+    "/home/pi/bikefit-api/logs/error.log",
+    "/home/pi/sre/daemon.log"
+  ],
+  "docker_containers": [
+    "bikefit-api",
+    "bikefit-frontend",
+    "coachonurai-api",
+    "trihonor-api-prod",
+    "vaultwarden"
+  ],
+  "docker_burst_limit": 3,
+  "declined_cooldown": 3600,
+  "truce_cooldown_seconds": 600,
+  "daily_cloud_api_limit": {
+    "gemini": 100,
+    "groq": 100,
+    "xai": 50,
+    "claude": 5
+  }
+}
