@@ -1,10 +1,34 @@
 
 
-https://github.com/user-attachments/assets/218de02b-4c89-4d2e-b764-8d0dbf694ddd
+# SRE Daemon — AI Self-Healing Engine (v5.5)
 
-# SRE Daemon — AI Self-Healing Engine (v5.1)
+<p align="center">
+  <img src="https://img.shields.io/badge/tests-19%20passed-4ade80?style=flat-square" alt="tests" />
+  <img src="https://img.shields.io/badge/Raspberry%20Pi-5-C11A41.svg?logo=Raspberry%20Pi&style=flat-square" alt="Raspberry Pi" />
+  <img src="https://img.shields.io/badge/Ollama-Local%20First-FC7E0F.svg?style=flat-square" alt="Ollama" />
+  <img src="https://img.shields.io/badge/Stripe-Pro%20Active-635BFF.svg?logo=Stripe&style=flat-square" alt="Stripe" />
+  <img src="https://img.shields.io/badge/License-Proprietary-blue.svg?style=flat-square" alt="License" />
+</p>
 
-> An advanced, production-grade AI-powered self-healing SRE daemon for Raspberry Pi 5. It monitors systemd journals and Docker events in real-time, diagnoses errors using a 6-tier hierarchical LLM fallback stack, and executes safe auto-remediation with a Human-in-the-Loop (HITL) approval gateway.
+> An advanced, production-grade AI-powered self-healing SRE daemon for Raspberry Pi 5, VPS, and cloud VMs. It monitors systemd journals and Docker events in real-time, diagnoses errors using a 6-tier hierarchical LLM fallback stack, and executes safe auto-remediation with a Human-in-the-Loop (HITL) approval gateway.
+
+---
+
+## ⚡ Quick Start & Installation
+
+Depending on your subscription plan, install SRE Daemon using one of the following commands:
+
+### Option A: Starter Tier (Self-Hosted Free)
+Runs entirely locally using your own infrastructure and configuration:
+```bash
+curl -sSL https://sre-daemon.com/install.sh | bash
+```
+
+### Option B: Pro / Scale Tiers (Managed Dashboard)
+Unlocks the hosted **SRE Platform Dashboard**, managed updates, and shared cloud LLM budgets:
+```bash
+curl -sSL https://sre-daemon.com/install.sh | SRE_API_KEY=sre_live_xxxxxxxxxxxxxxxx bash
+```
 
 ---
 
@@ -124,14 +148,15 @@ sudo systemctl start sre-daemon
 
 We are evolving `sre-daemon` from a simple healing agent into a fully-featured **SRE ChatOps Platform**. Our goal is to balance full automation with surgical human control while keeping the Raspberry Pi 5 resource footprint near zero.
 
-### 🧠 v6.0 Memory & Rule Engine
-* **[Planned] Local Memory Cache (SQLite + difflib)**:
-  * Store a structured hash/signature of the traceback and its successful repair script in `sre_state.db`.
-  * Before calling any LLM, perform a local fuzzy search using Python's `difflib.SequenceMatcher` to find matching historical errors.
-  * If a successful fix is found, propose it directly to the user, bypassing LLM API latency and cost entirely.
-* **[Planned] Auto-Apply Safe Rules**:
-  * Implement a counter for repeatedly approved fixes.
-  * If a specific repair script is manually approved 5 times with 100% success rate, the daemon elevates it to "Auto-Apply", resolving the crash immediately without sending a Telegram prompt.
+### 🧠 Self-Learning Strategy Registry & Otonom Hafıza (Implemented)
+* **Local Memory Cache (SQLite)**:
+  * Automatically stores the SHA-256 hash/signature of the traceback and its successful repair script in `sre_state.db`.
+  * Before calling any LLM, the daemon performs a local lookup for matching historical errors. If a successful fix is found, it is executed directly, bypassing LLM API latency and cost entirely ($0.0000 API cost).
+* **Cross-Container Generalization**:
+  * Strips out container/service names, syslog tags, and brackets, enabling identical errors across different containers/hosts to share the same cached solutions.
+* **Weight Decay & Auto-Blacklist**:
+  * Calculates time-decayed weights ($W_{decayed} = W_{base} \times 0.5^{(\text{age\_days}/30)}$) to deprecate old fixes.
+  * Subtracts weight on command failure; if a command's weight drops below 0, it is automatically blacklisted.
 
 ### 📱 ChatOps & Visual Monitoring
 * **[Planned] Telegram Log Insight**:
