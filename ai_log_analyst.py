@@ -18,6 +18,7 @@ import requests
 import anthropic
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 # ── Load .env manually if it exists (for cron compatibility) ──
 def load_env():
