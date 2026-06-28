@@ -86,10 +86,11 @@ class JournalWatcher(BaseWatcher):
                 found = True
                 break
 
-        if not found and unit != "-" and self.register_service_cb:
-            clean_unit = unit.split(".")[0]
-            tag = f"[{clean_unit.capitalize()}]"
-            self.register_service_cb(clean_unit, tag, False)
+        if not found and self.register_service_cb:
+            name = unit.split(".")[0] if unit != "-" else ident
+            if name != "-":
+                tag = f"[{name.capitalize()}]"
+                self.register_service_cb(name, tag, False)
 
         rate_key = f"journal:{unit}:{safe_msg[:80]}"
         if not self.rate_limiter.should_process(rate_key):
