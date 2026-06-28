@@ -223,6 +223,18 @@ def init_db():
                     PRIMARY KEY (provider, day)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_registry (
+                    error_hash      TEXT    NOT NULL,
+                    command         TEXT    NOT NULL,
+                    success_count   INTEGER DEFAULT 0,
+                    fail_count      INTEGER DEFAULT 0,
+                    weight          INTEGER DEFAULT 0,
+                    is_blacklisted  INTEGER DEFAULT 0,
+                    last_used       TEXT,
+                    PRIMARY KEY (error_hash, command)
+                )
+            """)
             # Default settings
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES ('autonomous_mode', '0')"
@@ -230,6 +242,92 @@ def init_db():
             conn.commit()
     except Exception as e:
         logger.error("SQLite init hatası: %s", str(e))
+
+def compute_error_hash(container_name: str, error_log_snippet: str) -> str:
+    raw = f"{container_name}::{error_log_snippet[:200].strip().lower()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+def get_best_strategy(db_path: Path, error_hash: str) -> Optional[str]:
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT command FROM strategy_registry
+                WHERE error_hash = ?
+                  AND is_blacklisted = 0
+                  AND weight >= 0
+                ORDER BY weight DESC, success_count DESC
+                LIMIT 1
+                """,
+                (error_hash,)
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        logger.error("Registry get error: %s", e)
+        return None
+
+def update_strategy_result(db_path: Path, error_hash: str, command: str, success: bool):
+    try:
+        now_str = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO strategy_registry
+                    (error_hash, command, success_count, fail_count, weight, is_blacklisted, last_used)
+                VALUES (?, ?, 0, 0, 0, 0, ?)
+                """,
+                (error_hash, command, now_str)
+            )
+            if success:
+                conn.execute(
+                    """
+                    UPDATE strategy_registry
+                    SET success_count = success_count + 1,
+                        weight = weight + 2,
+                        last_used = ?
+                    WHERE error_hash = ? AND command = ?
+                    """,
+                    (now_str, error_hash, command)
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE strategy_registry
+                    SET fail_count = fail_count + 1,
+                        weight = weight - 1,
+                        last_used = ?
+                    WHERE error_hash = ? AND command = ?
+                    """,
+                    (now_str, error_hash, command)
+                )
+            conn.execute(
+                """
+                UPDATE strategy_registry
+                SET is_blacklisted = 1
+                WHERE error_hash = ? AND command = ? AND weight < 0
+                """,
+                (error_hash, command)
+            )
+            conn.commit()
+            logger.info("[REGISTRY] Updated strategy: hash=%s, command=%s, success=%s", error_hash, command, success)
+    except Exception as e:
+        logger.error("Registry update error: %s", e)
+
+def register_actions_in_registry(db_path: Path, error_hash: str, actions: list, success: bool):
+    if not actions:
+        return
+    for act in actions:
+        if isinstance(act, dict):
+            if act.get("type") == "shell" and act.get("payload"):
+                cmd = act["payload"].strip()
+                if cmd:
+                    update_strategy_result(db_path, error_hash, cmd, success)
+        elif isinstance(act, str):
+            cmd = act.strip()
+            if cmd:
+                update_strategy_result(db_path, error_hash, cmd, success)
 
 def get_daemon_setting(key: str, default: str = "") -> str:
     try:
@@ -740,6 +838,76 @@ class HealingOrchestrator:
         
         # Token Minimization: Summarize log
         summarized_line = summarize_log(tagged_line)
+        container_name = project_tag.strip("[]")
+        error_log_snippet = summarized_line
+
+        # ── OTONOM HAFIZA ─────────────────────────────────────────────────────
+        _error_hash = compute_error_hash(container_name, error_log_snippet)
+        _cached_cmd = get_best_strategy(DB_PATH, _error_hash)
+
+        if _cached_cmd:
+            logger.info(f"[REGISTRY HIT] {container_name} hafızadan: {_cached_cmd}")
+            send_telegram_text(
+                TELEGRAM_CHAT_ID,
+                f"🧠 *Otonom Hafıza* — `{container_name}`\n"
+                f"Kayıtlı strateji (LLM Maliyeti: 0 token):\n`{_cached_cmd}`"
+            )
+            try:
+                _result = subprocess.run(
+                    _cached_cmd, shell=True, capture_output=True, text=True, timeout=60
+                )
+                _cache_success = _result.returncode == 0
+                _output = (_result.stdout + "\n" + _result.stderr).strip()
+            except Exception as _e:
+                logger.warning(f"[REGISTRY] Exception: {_e}")
+                _cache_success = False
+                _output = str(_e)
+
+            update_strategy_result(DB_PATH, _error_hash, _cached_cmd, _cache_success)
+
+            # Log and notify
+            save_heal_history(
+                error_hash=err_hash,
+                error_message=tagged_line,
+                project_tag=project_tag,
+                risk_level="Low",
+                prompt="Strategy Registry Cached Call",
+                llm_response=json.dumps([{"type": "shell", "payload": _cached_cmd}]),
+                llm_source="strategy-registry",
+                actions=[{"type": "shell", "payload": _cached_cmd}],
+                execution_output=[{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}],
+                success=_cache_success,
+                duration=time.time() - start_time
+            )
+            self._write_heal_log(tagged_line, _cached_cmd, "strategy-registry", _cache_success, project_tag, [{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
+            
+            report_incident_to_platform(
+                service=project_tag,
+                title=f"Autonomous Healing: {project_tag}",
+                logs=tagged_line,
+                status="resolved" if _cache_success else "failed",
+                proposed_command=_cached_cmd,
+                action_output=json.dumps([{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
+            )
+            append_incident_to_graph_doc(
+                service=project_tag,
+                title=f"Autonomous Healing: {project_tag}",
+                status="resolved" if _cache_success else "failed",
+                proposed_command=_cached_cmd,
+                success=_cache_success
+            )
+
+            if _cache_success:
+                logger.info("[REGISTRY] Cached strateji BAŞARILI, LLM atlandı.")
+                return
+            else:
+                logger.warning("[REGISTRY] Cached strateji başarısız → LLM fallback")
+                send_telegram_text(
+                    TELEGRAM_CHAT_ID,
+                    f"⚠️ `{container_name}` kayıtlı strateji başarısız, LLM devreye alındı."
+                )
+        # ── OTONOM HAFIZA SONU ────────────────────────────────────────────────
+
         prompt = self._build_prompt(summarized_line, project_tag, err_hash)
         
         result = None
@@ -830,6 +998,11 @@ class HealingOrchestrator:
                     executed_status = self.execute_approved_actions(actions, 0)
                     duration = time.time() - start_time
                     all_ok = all(e.get("status") == "success" for e in executed_status)
+                    # ── REGISTRY KAYIT ────────────────────────────────────────────────────
+                    if actions:
+                        register_actions_in_registry(DB_PATH, _error_hash, actions, success=all_ok)
+                        logger.info(f"[REGISTRY] {len(actions)} aksiyon kaydedildi (success={all_ok}, hash={_error_hash})")
+                    # ── REGISTRY KAYIT SONU ───────────────────────────────────────────────
 
                     if all_ok:
                         send_telegram_text(
@@ -898,6 +1071,11 @@ class HealingOrchestrator:
                     executed_status = self.execute_approved_actions(actions, 0)
                     duration = time.time() - start_time
                     all_ok = all(e.get("status") == "success" for e in executed_status)
+                    # ── REGISTRY KAYIT ────────────────────────────────────────────────────
+                    if actions:
+                        register_actions_in_registry(DB_PATH, _error_hash, actions, success=all_ok)
+                        logger.info(f"[REGISTRY] {len(actions)} aksiyon kaydedildi (success={all_ok}, hash={_error_hash})")
+                    # ── REGISTRY KAYIT SONU ───────────────────────────────────────────────
                     
                     if all_ok:
                         send_telegram_text(
