@@ -244,26 +244,52 @@ def init_db():
         logger.error("SQLite init hatası: %s", str(e))
 
 def compute_error_hash(container_name: str, error_log_snippet: str) -> str:
-    raw = f"{container_name}::{error_log_snippet[:200].strip().lower()}"
+    # Hash only the normalized error pattern to generalize across different containers
+    raw = error_log_snippet[:200].strip().lower()
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 def get_best_strategy(db_path: Path, error_hash: str) -> Optional[str]:
     try:
+        from datetime import datetime, timezone
         with sqlite3.connect(db_path) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT command FROM strategy_registry
+                SELECT command, weight, last_used 
+                FROM strategy_registry
                 WHERE error_hash = ?
                   AND is_blacklisted = 0
-                  AND weight >= 0
-                ORDER BY weight DESC, success_count DESC
-                LIMIT 1
                 """,
                 (error_hash,)
             )
-            row = cur.fetchone()
-            return row[0] if row else None
+            rows = cur.fetchall()
+            if not rows:
+                return None
+            
+            candidates = []
+            now_dt = datetime.now(timezone.utc)
+            
+            for command, weight, last_used in rows:
+                decayed_weight = weight
+                if last_used:
+                    try:
+                        last_used_dt = datetime.fromisoformat(last_used)
+                        age_days = (now_dt - last_used_dt).total_seconds() / 86400.0
+                        if age_days >= 30.0:
+                            decay_factor = 0.5 ** (age_days / 30.0)
+                            decayed_weight = int(weight * decay_factor)
+                    except Exception:
+                        pass
+                
+                if decayed_weight >= 0:
+                    candidates.append((command, decayed_weight, weight))
+            
+            if not candidates:
+                return None
+            
+            # Sort by decayed weight desc, then base weight desc
+            candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            return candidates[0][0]
     except Exception as e:
         logger.error("Registry get error: %s", e)
         return None

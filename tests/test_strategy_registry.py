@@ -54,10 +54,10 @@ class TestComputeErrorHash:
         h2 = compute_error_hash("myapp", "OOMKilled exit code 137")
         assert h1 == h2
 
-    def test_different_container_different_hash(self):
+    def test_same_error_different_container_same_hash(self):
         h1 = compute_error_hash("app1", "connection refused")
         h2 = compute_error_hash("app2", "connection refused")
-        assert h1 != h2
+        assert h1 == h2
 
     def test_hash_length_16(self):
         h = compute_error_hash("myapp", "some error")
@@ -121,6 +121,25 @@ class TestGetBestStrategy:
             )
             conn.commit()
         assert get_best_strategy(db_path, h) is None
+
+    def test_weight_decay(self, db_path):
+        from datetime import datetime, timezone, timedelta
+        h = "decay_hash"
+        # old command: 60 days age => decay 0.5**2 = 0.25. weight 10 * 0.25 = 2.
+        # new command: 0 days age => weight 4.
+        now_60_days_ago = (datetime.now(timezone.utc) - timedelta(days=60.1)).isoformat()
+        now_str = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO strategy_registry VALUES (?,?,?,?,?,?,?)",
+                (h, "old command", 5, 0, 10, 0, now_60_days_ago)
+            )
+            conn.execute(
+                "INSERT INTO strategy_registry VALUES (?,?,?,?,?,?,?)",
+                (h, "new command", 2, 0, 4, 0, now_str)
+            )
+            conn.commit()
+        assert get_best_strategy(db_path, h) == "new command"
 
 
 # ─────────────────────────────────────────────
