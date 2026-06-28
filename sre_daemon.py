@@ -244,8 +244,19 @@ def init_db():
         logger.error("SQLite init hatası: %s", str(e))
 
 def compute_error_hash(container_name: str, error_log_snippet: str) -> str:
-    # Hash only the normalized error pattern to generalize across different containers
-    raw = error_log_snippet[:200].strip().lower()
+    # Clean the log snippet by removing container name, service tags, brackets, and syslog headers
+    raw = error_log_snippet.lower()
+    if container_name:
+        c_name = container_name.lower().strip()
+        raw = raw.replace(c_name, "")
+    
+    # Remove all bracketed tags like [Mockservice], [ERR]
+    raw = re.sub(r'\[[^\]]+\]', '', raw)
+    
+    # Remove double spaces, strip, and take first 200 characters
+    raw = " ".join(raw.split())
+    raw = raw[:200].strip()
+    
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 def get_best_strategy(db_path: Path, error_hash: str) -> Optional[str]:
