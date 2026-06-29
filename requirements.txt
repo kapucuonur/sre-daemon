@@ -2,3 +2,7 @@ requests>=2.31.0
 pytest
 pytest-mock
 pyyaml>=6.0
+docker
+uvicorn
+typing
+docker

@@ -10,6 +10,10 @@ services:
     runtime: "docker-compose"
     compose_file: "/home/pi/bikefit/docker-compose.yml"
     container_name: "bikefit-api"
+    limits:
+      cpu_threshold: 80.0
+      mem_threshold: 85.0
+      anomaly_sensitivity: 1.5
 
   - name: "bikefit-frontend"
     runtime: "docker-compose"

@@ -25,6 +25,7 @@ import sqlite3
 import hashlib
 import difflib
 import stat
+import psutil
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -778,6 +779,10 @@ class ManifestLoader:
     @property
     def services(self) -> list:
         return self._data.get("services", [])
+
+    @property
+    def api_key(self) -> str:
+        return self._data.get("sre_api_key", "")
 
     def services_summary(self) -> str:
         """Generate a short services summary for LLM prompts."""
@@ -2323,7 +2328,20 @@ def send_telegram_text(chat_id: str, text: str):
 
 def report_incident_to_platform(service: str, title: str, logs: str, status: str, proposed_command: str, action_output: str):
     try:
-        url = "http://localhost:8003/api/daemon/incident"
+        platform_url = os.getenv("SRE_PLATFORM_URL", "https://sre.trihonor.com")
+        api_key = ""
+        
+        # Load API Key from manifest if available
+        if os.path.exists(MANIFEST_PATH):
+            try:
+                if YAML_AVAILABLE:
+                    with open(MANIFEST_PATH) as f:
+                        data = _yaml_mod.safe_load(f) or {}
+                        api_key = data.get("sre_api_key", "")
+            except Exception:
+                pass
+                
+        url = f"{platform_url.rstrip('/')}/api/daemon/incident"
         payload = {
             "service": service.strip("[]"),
             "title": title[:200],
@@ -2332,7 +2350,12 @@ def report_incident_to_platform(service: str, title: str, logs: str, status: str
             "proposed_command": proposed_command,
             "action_output": action_output
         }
-        resp = requests.post(url, json=payload, timeout=5)
+        
+        headers = {}
+        if api_key:
+            headers["X-SRE-API-Key"] = api_key
+            
+        resp = requests.post(url, json=payload, headers=headers, timeout=5)
         if resp.status_code != 200:
             logger.warning("Platforma incident raporlanamadı (kod: %d): %s", resp.status_code, resp.text)
     except Exception as e:
@@ -2538,6 +2561,243 @@ def _midnight_budget_reset():
 
 
 # ── Main Loop ────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREDICTIVE MAINTENANCE — MetricsCollector & Anomaly Detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MetricsCollector(threading.Thread):
+    """
+    Background thread that collects host and container metrics every 30 seconds.
+    Saves data to stats_history.db (capped to 24h of history).
+    Calculates EMA and flags anomalies to trigger proactive restarts or mitigations.
+    """
+    def __init__(self, orchestrator):
+        super().__init__(name="metrics-collector", daemon=True)
+        self.orchestrator = orchestrator
+        self.stats_db = INSTALL_DIR / "stats_history.db"
+        self._init_db()
+        self._anomaly_cooldown = {} # entity_metric -> timestamp of last warning
+        self._cooldown_seconds = 300 # 5 minutes cooldown per service/metric anomaly alert
+
+    def _init_db(self):
+        try:
+            with sqlite3.connect(self.stats_db) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS stats_history (
+                        timestamp TEXT NOT NULL,
+                        entity TEXT NOT NULL,
+                        metric_type TEXT NOT NULL,
+                        value REAL NOT NULL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_history_ts ON stats_history (timestamp)")
+                conn.commit()
+        except Exception as e:
+            logger.error("[METRICS] DB init error: %s", e)
+
+    def run(self):
+        logger.info("[METRICS] MetricsCollector active. Loop started (interval: 30s).")
+        while True:
+            try:
+                self._collect_and_analyze()
+            except Exception as e:
+                logger.error("[METRICS] Error in collection loop: %s", e)
+            time.sleep(30)
+
+    def _collect_and_analyze(self):
+        now_str = datetime.now(timezone.utc).isoformat()
+        host_cpu = 0.0
+        host_mem = 0.0
+        
+        # 1. Collect Host Metrics
+        try:
+            host_cpu = psutil.cpu_percent(interval=0.1)
+            host_mem = psutil.virtual_memory().percent
+            self._save_metric(now_str, "host", "cpu", host_cpu)
+            self._save_metric(now_str, "host", "mem", host_mem)
+            self._check_anomaly("host", "cpu", host_cpu)
+            self._check_anomaly("host", "mem", host_mem)
+        except Exception as e:
+            logger.warning("[METRICS] Failed to collect host stats: %s", e)
+
+        # 2. Collect Container Metrics
+        active_containers = []
+        try:
+            docker_res = subprocess.run(
+                ["docker", "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemPerc}}"],
+                capture_output=True, text=True, timeout=10
+            )
+            if docker_res.returncode == 0:
+                for line in docker_res.stdout.strip().splitlines():
+                    parts = line.split("|")
+                    if len(parts) >= 3:
+                        name = parts[0].strip()
+                        try:
+                            cpu_val = float(parts[1].replace("%", "").strip())
+                            mem_val = float(parts[2].replace("%", "").strip())
+                            self._save_metric(now_str, name, "cpu", cpu_val)
+                            self._save_metric(now_str, name, "mem", mem_val)
+                            self._check_anomaly(name, "cpu", cpu_val)
+                            self._check_anomaly(name, "mem", mem_val)
+                            active_containers.append(name)
+                        except ValueError:
+                            pass
+        except Exception as e:
+            logger.warning("[METRICS] Failed to collect container stats: %s", e)
+
+        # 3. Report current status to central SRE platform API
+        try:
+            self._report_status_to_platform(host_cpu, host_mem, active_containers)
+        except Exception as e:
+            logger.debug("[METRICS] Status report failed: %s", e)
+
+        # 4. Truncate historical data older than 24 hours
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            with sqlite3.connect(self.stats_db) as conn:
+                conn.execute("DELETE FROM stats_history WHERE timestamp < ?", (cutoff,))
+                conn.commit()
+        except Exception as e:
+            logger.error("[METRICS] Truncate failed: %s", e)
+
+    def _save_metric(self, timestamp: str, entity: str, metric_type: str, value: float):
+        try:
+            with sqlite3.connect(self.stats_db) as conn:
+                conn.execute(
+                    "INSERT INTO stats_history (timestamp, entity, metric_type, value) VALUES (?, ?, ?, ?)",
+                    (timestamp, entity, metric_type, value)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error("[METRICS] Save metric failed: %s", e)
+
+    def _check_anomaly(self, entity: str, metric_type: str, current_val: float):
+        if entity == "host":
+            return
+        # Retrieve thresholds from manifest
+        cpu_threshold = 80.0
+        mem_threshold = 85.0
+        sensitivity = 1.5
+        
+        # Load from manifest if available
+        svc_cfg = self.orchestrator.manifest.get_service_by_container(entity)
+        if svc_cfg and "limits" in svc_cfg:
+            lims = svc_cfg["limits"]
+            if isinstance(lims, dict):
+                cpu_threshold = float(lims.get("cpu_threshold", cpu_threshold))
+                mem_threshold = float(lims.get("mem_threshold", mem_threshold))
+                sensitivity = float(lims.get("anomaly_sensitivity", sensitivity))
+
+        limit = cpu_threshold if metric_type == "cpu" else mem_threshold
+
+        # Compute EMA over last 20 observations
+        ema_val = self._get_ema(entity, metric_type)
+        if ema_val is None:
+            return
+
+        # Check anomaly trigger condition
+        if current_val > limit and current_val > (ema_val * sensitivity):
+            # Cooldown check
+            key = f"{entity}_{metric_type}"
+            now = time.time()
+            if key in self._anomaly_cooldown:
+                if now - self._anomaly_cooldown[key] < self._cooldown_seconds:
+                    return # skip warning inside cooldown
+            
+            self._anomaly_cooldown[key] = now
+            logger.warning("[ANOMALY DETECTED] %s %s is at %.1f%% (EMA: %.1f%%, limit: %.1f%%)",
+                           entity, metric_type.upper(), current_val, ema_val, limit)
+            
+            # Fire predictive notification & trigger pre-emptive action in background
+            threading.Thread(
+                target=self._handle_predictive_fix,
+                args=(entity, metric_type, current_val, ema_val),
+                daemon=True
+            ).start()
+
+    def _get_ema(self, entity: str, metric_type: str, period: int = 20) -> Optional[float]:
+        try:
+            with sqlite3.connect(self.stats_db) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT value FROM stats_history
+                    WHERE entity = ? AND metric_type = ?
+                    ORDER BY timestamp DESC LIMIT ?
+                """, (entity, metric_type, period))
+                rows = cur.fetchall()
+                if len(rows) < 5: # Need at least 5 points to establish a trend
+                    return None
+                values = [r[0] for r in rows][::-1] # chronological order
+                
+                # Compute EMA
+                alpha = 2.0 / (period + 1)
+                ema = values[0]
+                for val in values[1:]:
+                    ema = (val * alpha) + (ema * (1 - alpha))
+                return ema
+        except Exception as e:
+            logger.error("[METRICS] get_ema error: %s", e)
+            return None
+
+    def _handle_predictive_fix(self, entity: str, metric_type: str, current_val: float, ema_val: float):
+        # Pre-emptive notification
+        metric_name = "CPU" if metric_type == "cpu" else "RAM"
+        msg = (
+            f"⚠️ *ANOMALY DETECTED:* Service `{entity}` {metric_name} is at {current_val:.1f}% (EMA: {ema_val:.1f}%). "
+            f"Leak/Spike pattern identified. To prevent service outage, "
+            f"starting **pre-emptive restart in 10 seconds**."
+        )
+        send_telegram_text(TELEGRAM_CHAT_ID, msg)
+        
+        # Wait 10 seconds (giving opportunity to read notification)
+        time.sleep(10)
+        
+        # Execute restart
+        svc_cfg = self.orchestrator.manifest.get_service_by_container(entity)
+        if svc_cfg:
+            logger.info("[PRE-EMPTIVE FIX] Restarting service: %s", entity)
+            ok, out = self.orchestrator.rebuild_manager.rebuild(svc_cfg)
+            if ok:
+                logger.info("[PRE-EMPTIVE FIX] Service restarted successfully")
+                send_telegram_text(TELEGRAM_CHAT_ID, f"✅ *Pre-emptive restart complete* for service `{entity}`.")
+            else:
+                logger.error("[PRE-EMPTIVE FIX] Restart failed: %s", out[:200])
+                send_telegram_text(TELEGRAM_CHAT_ID, f"❌ *Pre-emptive restart failed* for service `{entity}`:\n`{out[:150]}`")
+
+    def _report_status_to_platform(self, cpu: float, mem: float, containers: list):
+        api_key = self.orchestrator.manifest.api_key
+        
+        # Get disk usage
+        disk_pct = 0.0
+        try:
+            disk_pct = psutil.disk_usage("/").percent
+        except Exception:
+            pass
+            
+        payload = {
+            "tenant_id": self.orchestrator.manifest.tenant_id,
+            "cpu_temp": f"{cpu:.1f}%", # we send CPU usage as representation of load metric
+            "memory": f"{mem:.1f}%",
+            "disk": f"{disk_pct:.1f}%",
+            "containers": [{"name": c, "status": "Up (monitored)"} for c in containers]
+        }
+        
+        # Post to SRE Platform status endpoint
+        platform_url = os.getenv("SRE_PLATFORM_URL", "https://sre.trihonor.com")
+        url = f"{platform_url.rstrip('/')}/api/daemon/status"
+        
+        headers = {}
+        if api_key:
+            headers["X-SRE-API-Key"] = api_key
+            
+        try:
+            res = requests.post(url, json=payload, headers=headers, timeout=5)
+            if res.status_code != 200:
+                logger.debug("[METRICS] Platform status report rejected: %d", res.status_code)
+        except Exception as e:
+            logger.debug("[METRICS] Platform request error: %s", e)
+
 def main():
     logger.info("=" * 65)
     logger.info("SRE Daemon v5 — Hardened HITL & Self-Healing Engine başlatılıyor...")
@@ -2563,6 +2823,10 @@ def main():
     threading.Thread(target=timeout_worker, name="timeout-worker", daemon=True).start()
     threading.Thread(target=_midnight_budget_reset, name="budget-reset", daemon=True).start()
     start_self_monitor()
+    
+    # Start Predictive Metrics Collector
+    metrics_collector = MetricsCollector(orchestrator)
+    metrics_collector.start()
 
     logger.info("SRE Daemon active. Tenant: %s | Services: %d", orchestrator.manifest.tenant_id, len(orchestrator.manifest.services))
     stop_event = threading.Event()
