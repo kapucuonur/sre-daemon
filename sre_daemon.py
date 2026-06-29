@@ -247,6 +247,13 @@ def init_db():
                 )
             """)
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS error_hash_signatures (
+                    error_hash   TEXT PRIMARY KEY,
+                    raw_snippet  TEXT NOT NULL,
+                    created_at   TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS strategy_registry (
                     error_hash      TEXT    NOT NULL,
                     command         TEXT    NOT NULL,
@@ -280,7 +287,19 @@ def compute_error_hash(container_name: str, error_log_snippet: str) -> str:
     raw = " ".join(raw.split())
     raw = raw[:200].strip()
     
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    h = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    # Persist raw snippet for semantic similarity lookups
+    try:
+        now_str = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(DB_PATH) as _conn:
+            _conn.execute(
+                "INSERT OR IGNORE INTO error_hash_signatures (error_hash, raw_snippet, created_at) VALUES (?, ?, ?)",
+                (h, raw, now_str)
+            )
+            _conn.commit()
+    except Exception:
+        pass
+    return h
 
 def get_best_strategy(db_path: Path, error_hash: str) -> Optional[str]:
     try:
@@ -327,6 +346,66 @@ def get_best_strategy(db_path: Path, error_hash: str) -> Optional[str]:
     except Exception as e:
         logger.error("Registry get error: %s", e)
         return None
+
+
+def get_semantic_strategy(db_path: Path, raw_error: str, threshold: float = 0.82) -> Optional[tuple]:
+    """
+    Fuzzy semantic match over strategy_registry using difflib.SequenceMatcher.
+
+    Instead of requiring an exact hash match, this function compares the
+    incoming error text against all stored error signatures in the registry.
+    If similarity >= threshold, returns (command, similarity_score).
+
+    This enables cross-container and cross-customer learning:
+    - Customer A's NameError in Flask → fixes Customer B's NameError in FastAPI
+    - Same error type, different variable names → still matches
+
+    Returns None if no match found above threshold.
+    """
+    from difflib import SequenceMatcher
+
+    # Normalize incoming error (same logic as compute_error_hash but keep text)
+    normalized_new = " ".join(raw_error.lower().split())[:400]
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.cursor()
+            # Fetch all non-blacklisted strategies with their error signatures
+            cur.execute("""
+                SELECT sr.error_hash, sr.command, sr.weight, sr.last_used,
+                       eh.raw_snippet
+                FROM strategy_registry sr
+                LEFT JOIN error_hash_signatures eh ON sr.error_hash = eh.error_hash
+                WHERE sr.is_blacklisted = 0
+                  AND sr.weight >= 0
+                ORDER BY sr.weight DESC
+                LIMIT 200
+            """)
+            rows = cur.fetchall()
+    except Exception:
+        # Table may not exist yet — graceful fallback
+        return None
+
+    best_score = 0.0
+    best_command = None
+
+    for error_hash, command, weight, last_used, raw_snippet in rows:
+        if not raw_snippet:
+            continue
+        normalized_stored = " ".join(raw_snippet.lower().split())[:400]
+        score = SequenceMatcher(None, normalized_new, normalized_stored).ratio()
+        if score > best_score and score >= threshold:
+            best_score = score
+            best_command = command
+
+    if best_command:
+        logger.info(
+            "[SEMANTIC REGISTRY] Match found (similarity=%.2f%%) → %s",
+            best_score * 100, best_command[:80]
+        )
+        return best_command, best_score
+
+    return None
 
 def update_strategy_result(db_path: Path, error_hash: str, command: str, success: bool):
     try:
@@ -1180,14 +1259,24 @@ class HealingOrchestrator:
         # Build dynamic service context from manifest
         services_ctx = self.manifest.services_summary()
         return (
-            f"You are a senior Linux SRE and backend developer.\n"
-            f"Service/Project: {project_name}\n\n"
-            "Known services on this server (from manifest.yaml):\n"
+            # ── SRE PERSONA ───────────────────────────────────────────────────
+            "You are the Senior SRE Engineer for TriHonor's autonomous self-healing platform.\n"
+            "Your engineering principles (non-negotiable):\n"
+            "  1. NEVER use hardcoded paths. Always use relative paths or variables.\n"
+            "  2. ALWAYS write minimal, surgical patches — change only the broken line(s).\n"
+            "  3. NEVER restart a service unless the code patch alone cannot fix the issue.\n"
+            "  4. Prefer defensive code patterns: null checks, try/except, fallbacks.\n"
+            "  5. After a code patch (replace/write), a service rebuild will be triggered automatically — do NOT add a shell restart action unless it is a non-code issue.\n"
+            "  6. If the fix requires a new dependency, use 'append' on requirements.txt — not a shell pip install.\n"
+            "  7. Your patches must pass syntax validation for the target language before being applied.\n"
+            # ── CONTEXT ───────────────────────────────────────────────────────
+            f"\nCurrent service: {project_name}\n"
+            "Services registered in manifest.yaml:\n"
             f"{services_ctx}\n\n"
-            "IMPORTANT: When generating a 'replace' action, set 'target' to '__DETECTED_BY_SRE__'. "
-            "The daemon will automatically resolve the correct host file path from the traceback.\n"
+            "IMPORTANT: Set target=\"__DETECTED_BY_SRE__\" in replace/write actions. "
+            "The daemon resolves the real host path automatically from the traceback.\n"
             f"{past_context}\n"
-            "Analyze the following system error:\n"
+            "Analyze the following error and respond with the minimal surgical fix:\n"
             "1. Kök nedeni açıkla (1-2 cümle)\n"
             "2. Tekrarlanmaması için önlem öner\n"
             "3. Eğer hata otomatik olarak düzeltilebiliyorsa (örn: eksik python kütüphanesini requirements.txt'e ekleme, konteyner veya servis restart etme), bunu eylemler ('actions') dizisi olarak tanımla.\n\n"
@@ -1243,8 +1332,18 @@ class HealingOrchestrator:
         _error_hash = compute_error_hash(container_name, error_log_snippet)
         _cached_cmd = get_best_strategy(DB_PATH, _error_hash)
 
+        # Semantic fallback — fuzzy match if exact hash miss
+        _semantic_match = False
+        if not _cached_cmd:
+            sem = get_semantic_strategy(DB_PATH, error_log_snippet)
+            if sem:
+                _cached_cmd, _sim_score = sem
+                _semantic_match = True
+                logger.info("[SEMANTIC HIT] similarity=%.0f%% → %s", _sim_score * 100, _cached_cmd[:80])
+
         if _cached_cmd:
-            logger.info(f"[REGISTRY HIT] {container_name} hafızadan: {_cached_cmd}")
+            _hit_type = "semantic-registry" if _semantic_match else "strategy-registry"
+            logger.info(f"[REGISTRY HIT] {container_name} hafızadan ({_hit_type}): {_cached_cmd}")
             send_telegram_text(
                 TELEGRAM_CHAT_ID,
                 f"🧠 *Otonom Hafıza* — `{container_name}`\n"
@@ -1277,7 +1376,7 @@ class HealingOrchestrator:
                 success=_cache_success,
                 duration=time.time() - start_time
             )
-            self._write_heal_log(tagged_line, _cached_cmd, "strategy-registry", _cache_success, project_tag, [{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
+            self._write_heal_log(tagged_line, _cached_cmd, _hit_type, _cache_success, project_tag, [{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
             
             report_incident_to_platform(
                 service=project_tag,
