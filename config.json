@@ -41,5 +41,11 @@
     "groq": 100,
     "xai": 50,
     "claude": 5
-  }
+  } ,
+  "db_type": "sqlite",
+  "db_url": "postgresql://trihonor_admin:guclu_sifre_123@localhost/trihonor_prod"
+
+  ,
+  "gemini_cooldown": 30,
+  "db_type": "sqlite"
 }

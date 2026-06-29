@@ -1461,3 +1461,24 @@
 - **Timestamp**: 2026-06-29T12:03:47.617900+00:00
 - **Proposed Command**: `docker compose up -d --build bikefit-api`
 - **Success**: True
+
+## Incident: Autonomous Healing: [PostgreSQL]
+- **Service**: [PostgreSQL]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T12:49:16.659347+00:00
+- **Proposed Command**: `sudo useradd postgres`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T13:11:19.706509+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T13:11:20.767884+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
