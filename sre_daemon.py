@@ -1354,14 +1354,33 @@ class HealingOrchestrator:
                 elif act_type == "shell":
                     # Command whitelist filter
                     allowed_patterns = [
-                        r"^docker\s+compose\s+(up\s+-d\s+--build|restart|up\s+-d)(\s+[a-zA-Z0-9_-]+)?$",
-                        r"^docker\s+restart\s+[a-zA-Z0-9_-]+$",
-                        r"^systemctl\s+(restart|start)\s+[a-zA-Z0-9_.-]+$"
+                        r"^docker\\s+compose\\s+(up\\s+-d\\s+--build|restart|up\\s+-d)(\\s+[a-zA-Z0-9_-]+)?$",
+                        r"^docker\\s+restart\\s+[a-zA-Z0-9_-]+$",
+                        r"^systemctl\\s+(restart|start)\\s+[a-zA-Z0-9_.-]+$",
+                        r"^cd\\s+/home/pi/projects/[a-zA-Z0-9_.-]+\\s+&&\\s+docker\\s+compose\\s+(up\\s+-d\\s+--build|restart|up\\s+-d)(\\s+[a-zA-Z0-9_-]+)?$",
                     ]
+                    # Öğrenilmiş dinamik pattern'leri yükle
+                    allowed_patterns += _load_learned_patterns()
                     is_allowed = any(re.match(pat, payload) for pat in allowed_patterns)
-                    if not is_allowed or any(char in payload for char in [";", "|", "&", "`", "$", "\n", "\r"]):
-                        executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "yasaklı komut"})
+
+                    # Tehlikeli karakter kontrolü — LLM'e bile sormadan reddet
+                    dangerous_chars = any(char in payload for char in [";", "|", "`", "$", chr(10), chr(13)])
+                    if dangerous_chars:
+                        executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "tehlikeli karakter"})
                         continue
+
+                    if not is_allowed:
+                        logger.info("[WHITELIST] Whitelist dışı komut — LLM onay zinciri: %s", payload)
+                        approved, new_pattern = llm_approve_for_whitelist(payload, payload)
+                        if approved and new_pattern:
+                            allowed_patterns.append(new_pattern)
+                            _persist_learned_pattern(new_pattern)
+                            is_allowed = True
+                            logger.info("[WHITELIST] LLM onayladı, pattern kaydedildi: %s", new_pattern)
+                        else:
+                            executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "LLM onaylamadı"})
+                            _notify_telegram_rejection(payload, payload)
+                            continue
 
                     try:
                         cmd_args = payload.split()
@@ -1469,6 +1488,140 @@ class HealingOrchestrator:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError as e:
             logger.error("Heal log yazma hatası: %s", str(e))
+
+
+# ── Whitelist LLM Approval (dinamik öğrenen zincir) ──────────
+LEARNED_PATTERNS_FILE = "/home/pi/sre/learned_patterns.json"
+
+def _load_learned_patterns() -> list:
+    """Dosyadan dinamik olarak öğrenilmiş whitelist pattern'lerini yükle."""
+    if os.path.exists(LEARNED_PATTERNS_FILE):
+        try:
+            with open(LEARNED_PATTERNS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def _persist_learned_pattern(pattern: str):
+    """LLM onayladığı pattern'i kalıcı olarak kaydet."""
+    patterns = _load_learned_patterns()
+    if pattern not in patterns:
+        patterns.append(pattern)
+        with open(LEARNED_PATTERNS_FILE, "w") as f:
+            json.dump(patterns, f, indent=2)
+        logger.info("[WHITELIST] Yeni pattern öğrenildi ve kaydedildi: %s", pattern)
+
+def llm_approve_for_whitelist(payload: str, context: str) -> tuple:
+    """
+    Cascading LLM zinciri: Ollama 7b → Groq → Gemini
+    Komutun güvenli olup olmadığını ve whitelist regex pattern'ini üretir.
+    Dön: (approved: bool, pattern: str | None)
+    """
+    prompt = (
+        "Sen bir Linux güvenlik uzmanısın. Bir SRE daemon'ı şu komutu çalıştırmak istiyor:\n\n"
+        f"KOMUT: {payload}\n"
+        f"BAĞLAM: {context[:300]}\n\n"
+        "Görevin:\n"
+        "1. Bu komut gerçekten güvenli mi?\n"
+        "2. Güvenliyse, bu komutu kapsayan minimal bir Python regex pattern üret.\n\n"
+        "Tehlikeli (reddet): rm, wget, curl, pip install, apt, chmod, chown, echo > dosya\n"
+        "Güvenli: docker compose up/restart, docker restart, systemctl restart/start\n\n"
+        "Yanıtı SADECE JSON formatında ver, başka hiçbir şey yazma:\n"
+        '{"approved": true, "pattern": "^regex_pattern$", "reason": "kısa açıklama"}'
+    )
+
+    def _parse_json_response(text: str) -> dict:
+        text = text.strip()
+        text = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
+        m = re.search(r"\{.*?\}", text, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        return json.loads(text)
+
+    # 1. Local Ollama (Pi 7b — hızlı, ücretsiz, $0)
+    try:
+        r = requests.post("http://localhost:11434/api/generate", json={
+            "model": os.getenv("OLLAMA_MODEL_FAST", "qwen2.5-coder:7b"),
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.05, "num_predict": 300}
+        }, timeout=45)
+        r.raise_for_status()
+        result = _parse_json_response(r.json().get("response", ""))
+        if result.get("approved") and result.get("pattern"):
+            logger.info("[WHITELIST-LLM] Ollama 7b onayladı → pattern: %s", result["pattern"])
+            return True, result["pattern"]
+        if result.get("approved") is False:
+            logger.warning("[WHITELIST-LLM] Ollama 7b reddetti → sebep: %s", result.get("reason"))
+            return False, None
+    except Exception as e:
+        logger.warning("[WHITELIST-LLM] Ollama başarısız, Groq deneniyor: %s", e)
+
+    # 2. Groq fallback (ücretsiz, hızlı)
+    try:
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        if groq_key:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 300, "temperature": 0.05
+                },
+                timeout=20)
+            r.raise_for_status()
+            result = _parse_json_response(r.json()["choices"][0]["message"]["content"])
+            if result.get("approved") and result.get("pattern"):
+                logger.info("[WHITELIST-LLM] Groq onayladı → pattern: %s", result["pattern"])
+                return True, result["pattern"]
+            if result.get("approved") is False:
+                logger.warning("[WHITELIST-LLM] Groq reddetti → sebep: %s", result.get("reason"))
+                return False, None
+    except Exception as e:
+        logger.warning("[WHITELIST-LLM] Groq başarısız, Gemini deneniyor: %s", e)
+
+    # 3. Gemini fallback
+    try:
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+        if gemini_key:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}",
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=20)
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            result = _parse_json_response(text)
+            if result.get("approved") and result.get("pattern"):
+                logger.info("[WHITELIST-LLM] Gemini onayladı → pattern: %s", result["pattern"])
+                return True, result["pattern"]
+            if result.get("approved") is False:
+                logger.warning("[WHITELIST-LLM] Gemini reddetti → sebep: %s", result.get("reason"))
+                return False, None
+    except Exception as e:
+        logger.warning("[WHITELIST-LLM] Gemini başarısız: %s", e)
+
+    logger.error("[WHITELIST-LLM] Tüm zincir başarısız — komut güvenlik engelinde.")
+    return False, None
+
+def _notify_telegram_rejection(payload: str, context: str):
+    """Whitelist LLM zincirinin de reddettiği komutu Telegram'a bildir."""
+    try:
+        token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        if token and chat_id:
+            msg = (
+                "⚠️ *Whitelist Reddi — Manuel İnceleme Gerekiyor*\n\n"
+                f"Komut LLM tarafından da onaylanmadı:\n`{payload}`\n\n"
+                f"Bağlam:\n`{context[:250]}`"
+            )
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
+                timeout=10)
+    except Exception as e:
+        logger.error("[WHITELIST-LLM] Telegram rejection bildirimi başarısız: %s", e)
 
 def run_approved_actions(actions: List[Dict[str, Any]], action_id: int):
     orchestrator = HealingOrchestrator()
