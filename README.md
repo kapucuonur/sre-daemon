@@ -1,7 +1,7 @@
 # 🤖 SRE Daemon
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-19%20passed-4ade80?style=flat-square" alt="tests" />
+  <img src="https://img.shields.io/badge/tests-31%20passed-4ade80?style=flat-square" alt="tests" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20VPS%20%7C%20Pi%205-6366f1?style=flat-square" alt="Platform" />
   <img src="https://img.shields.io/badge/Ollama-Local%20First-FC7E0F.svg?style=flat-square" alt="Ollama" />
   <img src="https://img.shields.io/badge/Groq-Llama%203.3-f55036.svg?style=flat-square" alt="Groq Llama 3.3" />
@@ -40,10 +40,10 @@ curl -sSL https://sre.trihonor.com/install.sh | SRE_API_KEY=sre_live_xxxxxxxxxxx
 
 ## Key Concepts
 
-* **AI SRE (Site Reliability Engineer)**: An autonomous software agent that monitors system logs and Docker containers 24/7 to analyze and repair infrastructure issues automatically.
+* **Cognitive SRE (Predictive Maintenance)**: Moving beyond reactive log-healing, SRE Daemon continuously analyzes system and container metrics (CPU/RAM/Disk), detects exponential growth trends via Exponential Moving Averages (EMA), and executes pre-emptive restarts or optimizations before outages occur.
 * **Human-in-the-Loop (HITL)**: A safety gate where the AI proposes a code patch, but awaits explicit human confirmation (via Telegram buttons or Slack actions) before executing it in production.
-* **Stateless Retries**: Each fallback model starts with the original raw error log — preventing propagation of incorrect assumptions across the cascade.
-* **Dynamic Whitelist Learning**: A self-learning security layer that translates validated command exceptions into regex rules via LLMs and persists them to `learned_patterns.json`.
+* **Strategy Registry (Fuzzy Semantic Matching)**: Traceback signatures and successful commands are indexed in `sre_state.db`. If an exact hash miss occurs, a fuzzy semantic match (`difflib` > 82%) applies existing strategies across different containers, achieving **0-token cost** for similar problems.
+* **Language-Agnostic Validation**: Pre-validates patches in a temporary sandbox using appropriate compiler checks (`py_compile`, `node --check`, `ruby -c`, `bash -n`, `php -l`) before committing changes.
 * **Service Auto-Discovery**: Uses `docker inspect` at runtime to resolve container-internal paths (e.g. `/app/main.py`) to physical host paths — no hardcoded directories.
 
 ---
@@ -55,13 +55,15 @@ Any Linux Server (Pi 5, Ubuntu VPS, Debian, RHEL, ...)
 │
 ├── systemd journal (priority 0-3: emerg/alert/crit/err)
 ├── Docker events (die / oom / kill)
+├── Metrics Collector (psutil & docker stats time-series)
 │
 └── SRE Daemon (sre_daemon.py)
       │
-      ├── ManifestLoader      → reads manifest.yaml (services, runtimes, paths)
+      ├── ManifestLoader      → reads manifest.yaml (services, runtimes, limits)
       ├── ServiceDiscovery    → docker inspect → resolves container paths dynamically
       ├── LanguageValidator   → .py .js .go .rb .sh .php syntax sandbox
       ├── RebuildManager      → docker-compose / systemd / PM2 / Kubernetes / bare
+      ├── MetricsCollector    → SQLite time-series (stats_history.db) & EMA Anomaly Engine
       │
       ├── SQLite HITL State Machine (sre_state.db)
       ├── Independent Watchdog & Heartbeat
@@ -79,34 +81,29 @@ Any Linux Server (Pi 5, Ubuntu VPS, Debian, RHEL, ...)
 
 ## How It Works
 
-1. **Monitor**: `systemd journal` and Docker events are monitored in real-time.
-2. **Detection**: Errors and container crashes are captured and filtered.
+1. **Monitor & Collect**: `systemd journal` and Docker events are monitored in real-time while container/host metrics are recorded in `stats_history.db` every 30 seconds (capped to 24h).
+2. **Predictive Anomaly Detection**: Calculates a 20-point EMA. If usage spikes above the manifest limits and exceeds 1.5x of the EMA, SRE Daemon fires a Telegram pre-emptive warning and restarts the container 10 seconds before a crash occurs.
 3. **Diagnostics (Layer 2)**:
    - Python/Node/Go stack tracebacks are parsed automatically.
-   - `ServiceDiscovery` calls `docker inspect` to translate container paths (e.g. `/app/main.py`) to real host paths (e.g. `/home/user/myapp/main.py`) — works on **any customer server without hardcoded paths**.
-   - A 40-line surrounding code context is extracted and injected into the LLM prompt.
-   - If code context is present, the slow local Pi Ollama is skipped — cloud fallback is used directly.
-4. **Strategy Registry (Autonomous Memory)**:
-   - Traceback signatures (SHA-256 hashes) and successful resolution commands are saved in `sre_state.db`.
-   - Same incident recurring → cached fix applied instantly ($0.0000 API cost).
-   - **Weight Decay:** Strategy reliability degrades over time (W_decayed = W_base × 0.5^(age_days/30)). Failed strategies are blacklisted automatically.
+   - `ServiceDiscovery` calls `docker inspect` to translate container paths to real host paths.
+   - A 50-line surrounding code context is extracted and injected into the LLM prompt.
+   - SRE Persona constraints enforce safe, relative-path, minimal surgical patches.
+4. **Strategy Registry**:
+   - Exact hash matches and fuzzy semantic hits (>82% match) reuse historical success commands without query costs.
+   - **Weight Decay:** Base weights decay over time ($W_{decayed} = W \times 0.5^{age/30}$). Repetitive command failures automatically blacklist strategy records.
 5. **Dynamic Whitelist Filter**:
-   - Safe commands (`docker restart`, `systemctl restart`) run immediately.
-   - Unrecognized commands are validated by `llm_approve_for_whitelist`. If safe, a regex pattern is generated and saved to `learned_patterns.json`.
-   - Dangerous characters (`|`, `;`, `$`, backticks) are always blocked.
+   - Unrecognized commands trigger `llm_approve_for_whitelist`. Whitelisted patterns are saved to `learned_patterns.json`.
 6. **HITL & Visual Diffs (Layer 3)**:
-   - High-risk code repair actions (`replace`) generate a visual unified diff (`- old` / `+ new`) sent to Telegram/Slack for human review.
-   - `LanguageValidator` sandboxes the proposed patch using the appropriate tool for each language (`.py` → `py_compile`, `.js` → `node --check`, `.rb` → `ruby -c`, `.sh` → `bash -n`, etc.).
-   - On approval, the patch is atomically written. If syntax fails, the original file is restored from `.bak`.
-7. **Auto-Rebuild**: After a successful patch, `RebuildManager` automatically triggers the service restart using the runtime defined in `manifest.yaml` — `docker compose up -d --build`, `systemctl restart`, `pm2 restart`, or `kubectl rollout restart`.
-8. **Budget Auto-Reset**: A background thread resets daily API usage counters at midnight UTC — no manual intervention needed after hitting daily limits.
-9. **Watchdog Protection**: An independent watchdog monitors a `.heartbeat` file every 5s. If the daemon locks up, it triggers `git rollback` and restarts the service.
+   - Visual unified diffs (`- old` / `+ new`) are sent to Telegram/Slack. Sandboxed syntax validation runs on target files. Atomic writes occur only on success, otherwise rolled back from `.bak`.
+7. **Auto-Rebuild**: After a successful patch, `RebuildManager` automatically triggers service restarts (docker-compose, systemd, PM2, Kubernetes, or bare shell).
+8. **Budget & Limits**: Background thread resets cloud LLM budget counters at midnight UTC.
+9. **Watchdog Protection**: Monitors `.heartbeat` every 5s. Trigger git rollback on freeze.
 
 ---
 
 ## manifest.yaml — Service Configuration
 
-`install.sh` auto-generates `manifest.yaml` by discovering running Docker containers on your server. Edit it to add systemd units, PM2 apps, or Kubernetes deployments:
+`install.sh` auto-generates `manifest.yaml` by discovering running Docker containers. Edit it to configure systemd units, PM2 apps, Kubernetes deployments, and custom metrics thresholds:
 
 ```yaml
 # SRE Daemon — Tenant Manifest
@@ -120,6 +117,10 @@ services:
     runtime: "docker-compose"
     compose_file: "/home/user/myapp/docker-compose.yml"
     container_name: "myapp-api"
+    limits:
+      cpu_threshold: 80.0       # Trigger warning/restart if CPU > 80%
+      mem_threshold: 85.0       # Trigger warning/restart if RAM > 85%
+      anomaly_sensitivity: 1.5  # Trigger if current metric > 1.5x EMA
 
   - name: "background-worker"
     runtime: "systemd"
