@@ -17,7 +17,8 @@
     "kernel": "[Kernel-HW]",
     "usb": "[Kernel-HW]",
     "camera": "[Kernel-HW]",
-    "v4l": "[Kernel-HW]"
+    "v4l": "[Kernel-HW]",
+    "NetworkManager": "[Networkmanager]"
   },
   "log_files": [
     "/home/pi/bikefit-api/logs/analytics.jsonl",

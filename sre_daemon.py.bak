@@ -28,21 +28,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import requests
-# ── Load .env manually if it exists (for standalone test / cron compatibility) ──
-def load_env():
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                key, val = line.split("=", 1)
-                val = val.strip().strip("'").strip('"')
-                os.environ[key.strip()] = val
-
-load_env()
-
 
 # ── Configuration & Paths ────────────────────────────────────
 MAC_IP            = os.getenv("MAC_IP", "")
@@ -61,33 +46,25 @@ DB_PATH           = Path("/home/pi/sre/sre_state.db")
 HEARTBEAT_PATH    = Path("/home/pi/sre/.heartbeat")
 SELF_PATH         = Path(__file__).resolve()
 MAX_LOCAL_TRIES   = 3
-OLLAMA_TIMEOUT    = 180
+OLLAMA_TIMEOUT    = 60
 ANTHROPIC_TIMEOUT = 60
 RATE_LIMIT_SECONDS = 600
+DOCKER_BURST_LIMIT = 60
 
 # Locks & Cooldown Cache
 ACTION_LOCK       = threading.Lock()
 SELF_FIX_LOCK     = threading.Lock()
 DECLINED_ERRORS   = {}  # error_hash -> timestamp
-TRUCE_CACHE       = {}  # error_hash -> (timestamp, count)
+DECLINED_COOLDOWN = 3600  # 1 hour cooldown for rejected issues
 
-# Dynamic Config Loading
-CONFIG_PATH = Path(__file__).parent / "config.json"
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error loading config.json: {e}")
-    return {}
+NOISE_PATTERNS = re.compile(
+    r"(DEBUG|audit\(|systemd-logind|NetworkManager.*state|"
+    r"DHCP|avahi|dbus-daemon|Bluetooth|btusb|rfkill|"
+    r"CRON|anacron|logrotate|sre-daemon|sre-bridge)",
+    re.IGNORECASE
+)
 
-_config = load_config()
-
-NOISE_PATTERNS_STR = _config.get("noise_patterns", r"(DEBUG|audit\(|systemd-logind|NetworkManager.*state|DHCP|avahi|dbus-daemon|Bluetooth|btusb|rfkill|CRON|anacron|logrotate|sre-daemon|sre-bridge)")
-NOISE_PATTERNS = re.compile(NOISE_PATTERNS_STR, re.IGNORECASE)
-
-PROJECT_MAP = _config.get("project_map", {
+PROJECT_MAP = {
     "trihonor":       "[TriHonor-API]",
     "coachonurai":    "[AI-Coach]",
     "bikefit-api":    "[BikeFit-API]",
@@ -103,29 +80,7 @@ PROJECT_MAP = _config.get("project_map", {
     "usb":            "[Kernel-HW]",
     "camera":         "[Kernel-HW]",
     "v4l":            "[Kernel-HW]",
-})
-DOCKER_BURST_LIMIT = _config.get("docker_burst_limit", 3)
-DECLINED_COOLDOWN = _config.get("declined_cooldown", 3600)
-TRUCE_COOLDOWN_SECONDS = _config.get("truce_cooldown_seconds", 600)
-DAILY_CLOUD_LIMITS = _config.get("daily_cloud_api_limit", {
-    "gemini": 100,
-    "groq": 100,
-    "xai": 50,
-    "claude": 5
-})
-
-# Import Watchers dynamically
-try:
-    from monitors import JournalWatcher, DockerWatcher
-except ImportError:
-    class JournalWatcher:
-        def __init__(self, *args, **kwargs): pass
-        def start(self): pass
-        def stop(self): pass
-    class DockerWatcher:
-        def __init__(self, *args, **kwargs): pass
-        def start(self): pass
-        def stop(self): pass
+}
 
 log_dir = Path("/home/pi/sre")
 log_path = log_dir / "daemon.log" if log_dir.exists() else Path("daemon.log")
@@ -230,26 +185,6 @@ def init_db():
                     created_at TEXT
                 )
             """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS daily_api_usage (
-                    provider TEXT,
-                    day TEXT,
-                    count INTEGER,
-                    PRIMARY KEY (provider, day)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS strategy_registry (
-                    error_hash      TEXT    NOT NULL,
-                    command         TEXT    NOT NULL,
-                    success_count   INTEGER DEFAULT 0,
-                    fail_count      INTEGER DEFAULT 0,
-                    weight          INTEGER DEFAULT 0,
-                    is_blacklisted  INTEGER DEFAULT 0,
-                    last_used       TEXT,
-                    PRIMARY KEY (error_hash, command)
-                )
-            """)
             # Default settings
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES ('autonomous_mode', '0')"
@@ -257,129 +192,6 @@ def init_db():
             conn.commit()
     except Exception as e:
         logger.error("SQLite init hatası: %s", str(e))
-
-def compute_error_hash(container_name: str, error_log_snippet: str) -> str:
-    # Clean the log snippet by removing container name, service tags, brackets, and syslog headers
-    raw = error_log_snippet.lower()
-    if container_name:
-        c_name = container_name.lower().strip()
-        raw = raw.replace(c_name, "")
-    
-    # Remove all bracketed tags like [Mockservice], [ERR]
-    raw = re.sub(r'\[[^\]]+\]', '', raw)
-    
-    # Remove double spaces, strip, and take first 200 characters
-    raw = " ".join(raw.split())
-    raw = raw[:200].strip()
-    
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-def get_best_strategy(db_path: Path, error_hash: str) -> Optional[str]:
-    try:
-        from datetime import datetime, timezone
-        with sqlite3.connect(db_path) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT command, weight, last_used 
-                FROM strategy_registry
-                WHERE error_hash = ?
-                  AND is_blacklisted = 0
-                """,
-                (error_hash,)
-            )
-            rows = cur.fetchall()
-            if not rows:
-                return None
-            
-            candidates = []
-            now_dt = datetime.now(timezone.utc)
-            
-            for command, weight, last_used in rows:
-                decayed_weight = weight
-                if last_used:
-                    try:
-                        last_used_dt = datetime.fromisoformat(last_used)
-                        age_days = (now_dt - last_used_dt).total_seconds() / 86400.0
-                        if age_days >= 30.0:
-                            decay_factor = 0.5 ** (age_days / 30.0)
-                            decayed_weight = int(weight * decay_factor)
-                    except Exception:
-                        pass
-                
-                if decayed_weight >= 0:
-                    candidates.append((command, decayed_weight, weight))
-            
-            if not candidates:
-                return None
-            
-            # Sort by decayed weight desc, then base weight desc
-            candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            return candidates[0][0]
-    except Exception as e:
-        logger.error("Registry get error: %s", e)
-        return None
-
-def update_strategy_result(db_path: Path, error_hash: str, command: str, success: bool):
-    try:
-        now_str = datetime.now(timezone.utc).isoformat()
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO strategy_registry
-                    (error_hash, command, success_count, fail_count, weight, is_blacklisted, last_used)
-                VALUES (?, ?, 0, 0, 0, 0, ?)
-                """,
-                (error_hash, command, now_str)
-            )
-            if success:
-                conn.execute(
-                    """
-                    UPDATE strategy_registry
-                    SET success_count = success_count + 1,
-                        weight = weight + 2,
-                        last_used = ?
-                    WHERE error_hash = ? AND command = ?
-                    """,
-                    (now_str, error_hash, command)
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE strategy_registry
-                    SET fail_count = fail_count + 1,
-                        weight = weight - 1,
-                        last_used = ?
-                    WHERE error_hash = ? AND command = ?
-                    """,
-                    (now_str, error_hash, command)
-                )
-            conn.execute(
-                """
-                UPDATE strategy_registry
-                SET is_blacklisted = 1
-                WHERE error_hash = ? AND command = ? AND weight < 0
-                """,
-                (error_hash, command)
-            )
-            conn.commit()
-            logger.info("[REGISTRY] Updated strategy: hash=%s, command=%s, success=%s", error_hash, command, success)
-    except Exception as e:
-        logger.error("Registry update error: %s", e)
-
-def register_actions_in_registry(db_path: Path, error_hash: str, actions: list, success: bool):
-    if not actions:
-        return
-    for act in actions:
-        if isinstance(act, dict):
-            if act.get("type") == "shell" and act.get("payload"):
-                cmd = act["payload"].strip()
-                if cmd:
-                    update_strategy_result(db_path, error_hash, cmd, success)
-        elif isinstance(act, str):
-            cmd = act.strip()
-            if cmd:
-                update_strategy_result(db_path, error_hash, cmd, success)
 
 def get_daemon_setting(key: str, default: str = "") -> str:
     try:
@@ -400,125 +212,6 @@ def set_daemon_setting(key: str, value: str):
             conn.commit()
     except Exception as e:
         logger.error("Setting yazma hatası: %s", str(e))
-
-# ── Token Minimization Helpers ───────────────────────────────
-def get_daily_calls(model_provider: str) -> int:
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT count FROM daily_api_usage WHERE provider = ? AND day = ?",
-                (model_provider, today_str)
-            )
-            row = cur.fetchone()
-            return row[0] if row else 0
-    except Exception as e:
-        logger.error("Token budget check error: %s", e)
-        return 0
-
-def increment_daily_calls(model_provider: str):
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO daily_api_usage (provider, day, count) VALUES (?, ?, 1) "
-                "ON CONFLICT(provider, day) DO UPDATE SET count = count + 1",
-                (model_provider, today_str)
-            )
-            conn.commit()
-    except Exception as e:
-        logger.error("Token budget update error: %s", e)
-
-def summarize_log(raw_msg: str) -> str:
-    """Pre-processes and summarizes logs to reduce tokens sent to LLM."""
-    if not raw_msg or len(raw_msg) < 500:
-        return raw_msg
-
-    lines = raw_msg.splitlines()
-    if len(lines) <= 6:
-        return raw_msg
-
-    error_indicators = ["error", "exception", "failed", "traceback", "critical", "fatal"]
-    critical_lines = []
-    for i, line in enumerate(lines):
-        if any(ind in line.lower() for ind in error_indicators):
-            critical_lines.append((i, line))
-
-    summary_lines = []
-    summary_lines.append(f"[Start of Log Excerpt] {lines[0]}")
-
-    added_indices = {0}
-    for idx, line in critical_lines[:3]:
-        for neighbor in range(max(0, idx - 1), min(len(lines), idx + 2)):
-            if neighbor not in added_indices:
-                summary_lines.append(f"Line {neighbor + 1}: {lines[neighbor]}")
-                added_indices.add(neighbor)
-
-    summary_lines.append("... [truncated intermediate lines] ...")
-    for idx in range(max(0, len(lines) - 3), len(lines)):
-        if idx not in added_indices:
-            summary_lines.append(f"Line {idx + 1}: {lines[idx]}")
-
-    return "\n".join(summary_lines)
-
-# ── Self-Healing and Auto-discovery Helpers ──────────────────
-def register_discovered_service(service_name: str, tag: str, is_docker: bool = False):
-    """Autonomously registers a newly discovered service to config.json."""
-    try:
-        if service_name in PROJECT_MAP:
-            return
-
-        logger.info("New service discovered autonomously: %s -> %s", service_name, tag)
-        PROJECT_MAP[service_name] = tag
-
-        # Update config.json file
-        if CONFIG_PATH.exists():
-            with open(CONFIG_PATH, "r") as f:
-                cfg = json.load(f)
-            
-            # Update project map
-            if "project_map" not in cfg:
-                cfg["project_map"] = {}
-            cfg["project_map"][service_name] = tag
-
-            # Update lists
-            if is_docker:
-                if "docker_containers" not in cfg:
-                    cfg["docker_containers"] = []
-                if service_name not in cfg["docker_containers"]:
-                    cfg["docker_containers"].append(service_name)
-            
-            # Atomic write
-            temp_path = CONFIG_PATH.with_suffix(".tmp")
-            with open(temp_path, "w") as f:
-                json.dump(cfg, f, indent=2)
-            temp_path.replace(CONFIG_PATH)
-            logger.info("config.json has been autonomously updated.")
-    except Exception as e:
-        logger.error("Failed to autonomously update config.json: %s", e)
-
-def append_incident_to_graph_doc(service: str, title: str, status: str, proposed_command: str, success: bool):
-    """Appends incident details to sre_incidents.md to trigger graphify-watch updates."""
-    try:
-        incident_file = Path("/home/pi/sre/sre_incidents.md")
-        if not incident_file.parent.exists():
-            incident_file = Path("sre_incidents.md")
-        
-        now_str = datetime.now(timezone.utc).isoformat()
-        entry = (
-            f"\n## Incident: {title}\n"
-            f"- **Service**: {service}\n"
-            f"- **Status**: {status}\n"
-            f"- **Timestamp**: {now_str}\n"
-            f"- **Proposed Command**: `{proposed_command}`\n"
-            f"- **Success**: {success}\n"
-        )
-        with open(incident_file, "a") as f:
-            f.write(entry)
-        logger.info("Incident appended to graph document: %s", incident_file)
-    except Exception as e:
-        logger.error("Error appending incident to graph doc: %s", e)
 
 def save_heal_history(
     error_hash: str, error_message: str, project_tag: str, risk_level: str,
@@ -636,101 +329,6 @@ def start_heartbeat():
     t.start()
 
 # ── Rate Limiter ─────────────────────────────────────────────
-
-# ── File Editor & Patch Validation Sandbox ───────────────────
-class FileEditor:
-    """
-    SRE Daemon File Management, Syntax Validation & Safe Patching Sandbox
-    """
-    def __init__(self):
-        pass
-
-    def read_file(self, file_path: str, start_line: int = 1, end_line: int = None) -> str:
-        try:
-            if not os.path.exists(file_path):
-                return f"Error: File {file_path} not found"
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-            
-            end_line = end_line or len(lines)
-            selected = lines[start_line-1:end_line]
-            return "".join(selected)
-        except Exception as e:
-            return f"Error reading file: {e}"
-
-    def write_file(self, file_path: str, content: str) -> None:
-        """Atomically writes content to the target file."""
-        temp_path = file_path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(temp_path, file_path)
-
-    def validate_syntax(self, file_path: str) -> tuple:
-        """
-        Validates python file syntax using py_compile.
-        Returns: (is_valid: bool, error_message: str)
-        """
-        if not file_path.endswith(".py"):
-            return True, ""
-        try:
-            import py_compile
-            py_compile.compile(file_path, doraise=True)
-            return True, ""
-        except py_compile.PyCompileError as e:
-            return False, str(e)
-        except Exception as e:
-            return False, str(e)
-
-    def apply_patch(self, file_path: str, search_block: str, replace_block: str, dry_run: bool = False) -> tuple:
-        """
-        Attempts to apply a search-and-replace block, validates compile syntax, 
-        and rolls back if syntax validation fails.
-        Returns: (success: bool, detail: str)
-        """
-        try:
-            if not os.path.exists(file_path):
-                return False, f"File {file_path} not found"
-            
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            if search_block not in content:
-                # Try with normalized whitespace if exact match fails
-                normalized_content = re.sub(r"\s+", " ", content)
-                normalized_search = re.sub(r"\s+", " ", search_block)
-                if normalized_search not in normalized_content:
-                    return False, "Search block not found in file content"
-
-            # Perform substitution
-            patched_content = content.replace(search_block, replace_block)
-
-            # Sandbox validation via temp file
-            temp_test_path = file_path + "_test_patch.py"
-            with open(temp_test_path, "w", encoding="utf-8") as f:
-                f.write(patched_content)
-
-            is_valid, err_msg = self.validate_syntax(temp_test_path)
-            if os.path.exists(temp_test_path):
-                os.unlink(temp_test_path)
-
-            if not is_valid:
-                return False, f"Syntax validation failed: {err_msg}"
-
-            if not dry_run:
-                # Create backup
-                backup_path = file_path + ".bak"
-                with open(backup_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-                # Write patched file atomically
-                self.write_file(file_path, patched_content)
-                return True, "Patch applied and verified successfully"
-            
-            return True, "Dry-run validation successful"
-            
-        except Exception as e:
-            return False, f"Patch failed: {e}"
-
 class RateLimiter:
     def __init__(self):
         self._seen: dict[str, float] = {}
@@ -749,7 +347,167 @@ class RateLimiter:
             return True
 
 # ── Watchers ─────────────────────────────────────────────────
-# Loaded dynamically from the monitors module at runtime.
+class JournalWatcher:
+    JOURNAL_CMD = [
+        "journalctl", "-f", "-n", "0", "-p", "err", "-o", "json",
+        "--no-pager", "--no-hostname"
+    ]
+
+    def __init__(self, rate_limiter: RateLimiter, callback):
+        self.rate_limiter = rate_limiter
+        self.callback = callback
+        self._stop_event = threading.Event()
+        self._proc: Optional[subprocess.Popen] = None
+
+    def start(self):
+        threading.Thread(target=self._watch, name="journal-watcher", daemon=True).start()
+        logger.info("JournalWatcher aktif.")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
+
+    def _watch(self):
+        while not self._stop_event.is_set():
+            try:
+                self._proc = subprocess.Popen(
+                    self.JOURNAL_CMD,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+                for raw_line in self._proc.stdout:
+                    if self._stop_event.is_set():
+                        break
+                    self._process_line(raw_line.strip())
+            except Exception as e:
+                logger.error("JournalWatcher hata: %s", str(e))
+                time.sleep(10)
+
+    def _process_line(self, raw_line: str):
+        if not raw_line:
+            return
+        try:
+            entry = json.loads(raw_line)
+        except json.JSONDecodeError:
+            return
+
+        message   = entry.get("MESSAGE", "")
+        unit      = entry.get("_SYSTEMD_UNIT", "-")
+        ident     = entry.get("SYSLOG_IDENTIFIER", "-")
+        priority  = int(entry.get("PRIORITY", 6))
+
+        if priority > 3:
+            return
+        if NOISE_PATTERNS.search(f"{unit} {ident} {message}"):
+            return
+
+        safe_msg = str(message)[:2000]
+        if not safe_msg:
+            return
+
+        # Derive project tag
+        combined = f"{unit} {ident} {safe_msg}".lower()
+        tag = "[System]"
+        for keyword, mapped_tag in PROJECT_MAP.items():
+            if keyword in combined:
+                tag = mapped_tag
+                break
+
+        rate_key = f"journal:{unit}:{safe_msg[:80]}"
+        if not self.rate_limiter.should_process(rate_key):
+            return
+
+        priority_label = {0: "EMERG", 1: "ALERT", 2: "CRIT", 3: "ERR"}.get(priority, "ERR")
+        tagged = f"{tag} [{priority_label}][{ident}] {safe_msg}"
+        self.callback(tagged, tag)
+
+class DockerWatcher:
+    CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
+    DOCKER_EVENTS_CMD = [
+        "docker", "events", "--filter", "type=container",
+        "--filter", "event=die", "--filter", "event=oom", "--filter", "event=kill",
+        "--format", "{{json .}}"
+    ]
+
+    def __init__(self, rate_limiter: RateLimiter, callback):
+        self.rate_limiter = rate_limiter
+        self.callback = callback
+        self._stop_event = threading.Event()
+        self._proc: Optional[subprocess.Popen] = None
+
+    def start(self):
+        threading.Thread(target=self._watch, name="docker-watcher", daemon=True).start()
+        logger.info("DockerWatcher aktif.")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
+
+    def _watch(self):
+        while not self._stop_event.is_set():
+            try:
+                self._proc = subprocess.Popen(
+                    self.DOCKER_EVENTS_CMD,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+                for raw_line in self._proc.stdout:
+                    if self._stop_event.is_set():
+                        break
+                    self._process_event(raw_line.strip())
+            except Exception as e:
+                logger.error("DockerWatcher hata: %s", str(e))
+                time.sleep(15)
+
+    def _process_event(self, raw_line: str):
+        if not raw_line:
+            return
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            return
+
+        container_id   = event.get("id", "")
+        container_name = event.get("Actor", {}).get("Attributes", {}).get("name", "unknown")
+        action         = event.get("Action", "die")
+
+        if not self.CONTAINER_ID_RE.match(container_id):
+            return
+
+        tag = "[Docker]"
+        name_lower = container_name.lower()
+        for keyword, mapped_tag in PROJECT_MAP.items():
+            if keyword in name_lower:
+                tag = mapped_tag
+                break
+
+        rate_key = f"docker:{container_name}:{action}"
+        if not self.rate_limiter.should_process(rate_key, DOCKER_BURST_LIMIT):
+            return
+
+        # Fetch logs
+        try:
+            res = subprocess.run(["docker", "logs", "--tail", "30", container_id], capture_output=True, text=True, timeout=10)
+            logs = (res.stdout + res.stderr).strip()
+            error_lines = [l for l in logs.splitlines() if re.search(r"error|exception|traceback|fatal|fail", l, re.IGNORECASE)]
+            log_summary = "\n".join(error_lines[-20:]) if error_lines else logs[-1000:]
+        except Exception as e:
+            log_summary = f"Log hatası: {str(e)}"
+
+        tagged = f"{tag} [DOCKER-{action.upper()}] Container '{container_name}' çöktü.\nSon loglar:\n{log_summary}"
+        self.callback(tagged, tag)
 
 # ── Clients ──────────────────────────────────────────────────
 class MacChecker:
@@ -880,7 +638,6 @@ class HealingOrchestrator:
         self.groq         = GroqClient()
         self.xai          = XAIClient()
         self.anthropic    = AnthropicClient()
-        self.file_editor  = FileEditor()
 
     def handle_error(self, tagged_line: str, project_tag: str, err_hash: str = None):
         if not err_hash:
@@ -894,23 +651,12 @@ class HealingOrchestrator:
                 logger.info("Aynı hata son 1 saatte reddedilmiş, yoksayılıyor: %s", project_tag)
                 return
 
-        # Truce (Ateşkes) Cooldown Check
-        if err_hash in TRUCE_CACHE:
-            last_time, count = TRUCE_CACHE[err_hash]
-            if now - last_time < TRUCE_COOLDOWN_SECONDS:
-                TRUCE_CACHE[err_hash] = (last_time, count + 1)
-                logger.info("Truce (Ateşkes) aktif: Hata '%s' son %d saniyede zaten inceleniyor. Tekrarlama adedi: %d", project_tag, TRUCE_COOLDOWN_SECONDS, count + 1)
-                return
-        
-        # Register in Truce cache
-        TRUCE_CACHE[err_hash] = (now, 1)
-
         threading.Thread(
             target=self._heal, args=(tagged_line, project_tag, err_hash),
             name=f"healer-{project_tag}", daemon=True
         ).start()
 
-    def _build_prompt(self, tagged_line: str, project_tag: str, err_hash: str = None, context_section: str = "") -> str:
+    def _build_prompt(self, tagged_line: str, project_tag: str, err_hash: str = None) -> str:
         project_name = project_tag.strip("[]")
 
         # Reflexive Learning: inject past outcomes for this error hash
@@ -937,7 +683,7 @@ class HealingOrchestrator:
             f"Sistem: Raspberry Pi 5 | Proje/Servis: {project_name}\n\n"
             "Pi üzerindeki bilinen proje dizinleri ve docker-compose yolları şunlardır:\n"
             "- BikeFit-API (bikefit-api): Proje dizini: /home/pi/bikefit-api | docker-compose dizini: /home/pi/bikefit (docker-compose.yml burada yer alır)\n"
-            "- AI-Coach (api): Proje dizini: /home/pi/projects/AI-Coach | docker-compose dizini: /home/pi/projects/AI-Coach (docker-compose.yml burada yer alır)\n"
+            "- AI-Coach (coachonurai-api): Proje dizini: /home/pi/projects/AI-Coach | docker-compose dizini: /home/pi/projects/AI-Coach (docker-compose.yml burada yer alır)\n"
             "- TriHonor-API (trihonor-api-prod): Proje dizini: /home/pi/TriHonor-API | docker-compose dizini: /home/pi/TriHonor-API (docker-compose.prod.yml burada yer alır)\n"
             f"{past_context}\n"
             "Aşağıdaki sistem hata mesajını analiz et:\n"
@@ -948,18 +694,15 @@ class HealingOrchestrator:
             "- 'append': Bir dosyaya yeni bir satır eklemek için (örn: target='/home/pi/bikefit-api/requirements.txt', payload='slowapi')\n"
             "- 'write': Bir dosyanın üzerine tam kod içeriğini yazmak için.\n"
             "- 'replace': Bir dosyada belirli bir kod bloğunu yeni kod bloğuyla değiştirmek için.\n"
-            "- 'replace': Bir dosyada belirli bir kod bloğunu yeni kod bloğuyla değiştirmek için.\n"
-            "  Format: {\"type\": \"replace\", \"target\": \"/home/pi/bikefit/pi_main.py\", \"search\": \"eski_kod_satiri\", \"replace\": \"yeni_kod_satiri\"}\n"
             "- 'shell': Güvenli bir komut çalıştırmak için (örn: target='/home/pi/bikefit', payload='docker compose up -d --build bikefit-api').\n"
             "  NOT: Shell komutları yalnızca docker compose, docker restart veya systemctl restart/start komutları olmalıdır. Güvenli olmayan veya izin verilmeyen hiçbir komut çalıştırma!\n\n"
-            f"{context_section}"
             f"HATA:\n{tagged_line[:1500]}\n\n"
             "JSON formatında yanıt ver. Yanıtın mutlaka geçerli bir JSON olmalıdır ve kod blokları içermemelidir. Örnek şema:\n"
             "{\n"
             '  "root_cause": "Kök neden açıklaması",\n'
             '  "prevention": "Önlem açıklaması",\n'
             '  "actions": [\n'
-            '    {"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\\n    if not results or len(results[0].boxes) == 0:\\n        raise HTTPException(status_code=422, detail=\"YOLO failed\")"},\n'
+            '    {"type": "append", "target": "/home/pi/bikefit-api/requirements.txt", "payload": "slowapi"},\n'
             '    {"type": "shell", "target": "/home/pi/bikefit", "payload": "docker compose up -d --build bikefit-api"}\n'
             '  ]\n'
             "}"
@@ -986,128 +729,11 @@ class HealingOrchestrator:
     def _heal(self, tagged_line: str, project_tag: str, err_hash: str):
         autonomous = get_daemon_setting("autonomous_mode", "0") == "1"
         start_time = time.time()
-        
-        # Token Minimization: Summarize log
-        summarized_line = summarize_log(tagged_line)
-        container_name = project_tag.strip("[]")
-        error_log_snippet = summarized_line
-
-        # ── OTONOM HAFIZA ─────────────────────────────────────────────────────
-        _error_hash = compute_error_hash(container_name, error_log_snippet)
-        _cached_cmd = get_best_strategy(DB_PATH, _error_hash)
-
-        if _cached_cmd:
-            logger.info(f"[REGISTRY HIT] {container_name} hafızadan: {_cached_cmd}")
-            send_telegram_text(
-                TELEGRAM_CHAT_ID,
-                f"🧠 *Otonom Hafıza* — `{container_name}`\n"
-                f"Kayıtlı strateji (LLM Maliyeti: 0 token):\n`{_cached_cmd}`"
-            )
-            try:
-                _result = subprocess.run(
-                    _cached_cmd, shell=True, capture_output=True, text=True, timeout=60
-                )
-                _cache_success = _result.returncode == 0
-                _output = (_result.stdout + "\n" + _result.stderr).strip()
-            except Exception as _e:
-                logger.warning(f"[REGISTRY] Exception: {_e}")
-                _cache_success = False
-                _output = str(_e)
-
-            update_strategy_result(DB_PATH, _error_hash, _cached_cmd, _cache_success)
-
-            # Log and notify
-            save_heal_history(
-                error_hash=err_hash,
-                error_message=tagged_line,
-                project_tag=project_tag,
-                risk_level="Low",
-                prompt="Strategy Registry Cached Call",
-                llm_response=json.dumps([{"type": "shell", "payload": _cached_cmd}]),
-                llm_source="strategy-registry",
-                actions=[{"type": "shell", "payload": _cached_cmd}],
-                execution_output=[{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}],
-                success=_cache_success,
-                duration=time.time() - start_time
-            )
-            self._write_heal_log(tagged_line, _cached_cmd, "strategy-registry", _cache_success, project_tag, [{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
-            
-            report_incident_to_platform(
-                service=project_tag,
-                title=f"Autonomous Healing: {project_tag}",
-                logs=tagged_line,
-                status="resolved" if _cache_success else "failed",
-                proposed_command=_cached_cmd,
-                action_output=json.dumps([{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
-            )
-            append_incident_to_graph_doc(
-                service=project_tag,
-                title=f"Autonomous Healing: {project_tag}",
-                status="resolved" if _cache_success else "failed",
-                proposed_command=_cached_cmd,
-                success=_cache_success
-            )
-
-            if _cache_success:
-                logger.info("[REGISTRY] Cached strateji BAŞARILI, LLM atlandı.")
-                return
-            else:
-                logger.warning("[REGISTRY] Cached strateji başarısız → LLM fallback")
-                send_telegram_text(
-                    TELEGRAM_CHAT_ID,
-                    f"⚠️ `{container_name}` kayıtlı strateji başarısız, LLM devreye alındı."
-                )
-        # ── OTONOM HAFIZA SONU ────────────────────────────────────────────────
-
-        # Traceback ve kod bağlamı analizi (Diagnostic Layer 2)
-        file_context = ""
-        try:
-            match = re.search(r'File "([^"]+\.py)", line (\d+)', tagged_line)
-            if match:
-                raw_file = match.group(1)
-                line_no = int(match.group(2))
-                
-                # Docker path translation to Pi physical path
-                target_file = raw_file
-                if raw_file.startswith("/app/"):
-                    proj_clean = project_tag.strip("[]").lower()
-                    if "bikefit" in proj_clean:
-                        target_file = raw_file.replace("/app/", "/home/pi/bikefit-api/")
-                    elif "trihonor" in proj_clean:
-                        target_file = raw_file.replace("/app/", "/home/pi/TriHonor-API/")
-                    elif "ai-coach" in proj_clean:
-                        target_file = raw_file.replace("/app/", "/home/pi/projects/AI-Coach/")
-                elif not raw_file.startswith("/home/pi/"):
-                    proj_clean = project_tag.strip("[]").lower()
-                    if "bikefit" in proj_clean:
-                        target_file = "/home/pi/bikefit-api/" + os.path.basename(raw_file)
-                    elif "trihonor" in proj_clean:
-                        target_file = "/home/pi/TriHonor-API/" + os.path.basename(raw_file)
-
-                logger.info("[DIAGNOSTIC] Traceback algılandı: %s L%d. Kod bağlamı okunuyor...", target_file, line_no)
-                
-                # Context satırlarını oku (satır -20 ve +20)
-                start_line = max(1, line_no - 20)
-                end_line = line_no + 20
-                raw_code = self.file_editor.read_file(target_file, start_line, end_line)
-                if raw_code and not raw_code.startswith("Error"):
-                    file_context = (
-                        f"HATANIN ALINDIĞI KOD DOSYASI BAĞLAMI ({target_file} satır {start_line}-{end_line}):\n"
-                        "```python\n"
-                        f"{raw_code}\n"
-                        "```\n"
-                        "Bu kod bağlamını incele, hata satırını tespit et ve buna uygun bir 'replace' aksiyonu üret.\n\n"
-                    )
-        except Exception as e_diag:
-            logger.warning("[DIAGNOSTIC] Kod bağlamı okunamadı: %s", e_diag)
-
-        prompt = self._build_prompt(summarized_line, project_tag, err_hash, context_section=file_context)
-        
+        prompt = self._build_prompt(tagged_line, project_tag, err_hash)
         result = None
         source = None
         success = False
 
-        # 1. Local Mac Ollama (if online)
         mac_online = self.mac_checker.is_mac_online()
         if mac_online:
             for attempt in range(1, MAX_LOCAL_TRIES + 1):
@@ -1118,33 +744,21 @@ class HealingOrchestrator:
                     break
                 time.sleep(5 * attempt)
 
-        # Budget helper
-        def run_with_budget(provider_name: str, query_fn) -> Optional[str]:
-            limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
-            current = get_daily_calls(provider_name)
-            if current >= limit:
-                logger.warning("Daily API budget exceeded for %s (%d/%d calls). Skipping.", provider_name, current, limit)
-                return None
-            res = query_fn()
-            if res is not None:
-                increment_daily_calls(provider_name)
-            return res
-
         # 2. Google Gemini API (Free tier)
         if not success and GEMINI_API_KEY:
-            result = run_with_budget("gemini", lambda: self.gemini.query(prompt))
+            result = self.gemini.query(prompt)
             source = "gemini/gemini-2.5-flash"
             success = result is not None
 
         # 3. Groq API (Free tier)
         if not success and GROQ_API_KEY:
-            result = run_with_budget("groq", lambda: self.groq.query(prompt))
+            result = self.groq.query(prompt)
             source = "groq/llama-3.3-70b-versatile"
             success = result is not None
 
         # 4. Grok (xAI) API (Cheap cloud fallback)
         if not success and XAI_API_KEY:
-            result = run_with_budget("xai", lambda: self.xai.query(prompt))
+            result = self.xai.query(prompt)
             source = "xai/grok-2-1212"
             success = result is not None
 
@@ -1159,8 +773,8 @@ class HealingOrchestrator:
                 time.sleep(5 * attempt)
 
         # 6. Anthropic Claude (Expensive cloud fallback)
-        if not success and ANTHROPIC_KEY:
-            result = run_with_budget("claude", lambda: self.anthropic.query(prompt))
+        if not success:
+            result = self.anthropic.query(prompt)
             source = "anthropic/claude-sonnet-4-6"
             success = result is not None
 
@@ -1191,11 +805,6 @@ class HealingOrchestrator:
                     executed_status = self.execute_approved_actions(actions, 0)
                     duration = time.time() - start_time
                     all_ok = all(e.get("status") == "success" for e in executed_status)
-                    # ── REGISTRY KAYIT ────────────────────────────────────────────────────
-                    if actions:
-                        register_actions_in_registry(DB_PATH, _error_hash, actions, success=all_ok)
-                        logger.info(f"[REGISTRY] {len(actions)} aksiyon kaydedildi (success={all_ok}, hash={_error_hash})")
-                    # ── REGISTRY KAYIT SONU ───────────────────────────────────────────────
 
                     if all_ok:
                         send_telegram_text(
@@ -1243,13 +852,6 @@ class HealingOrchestrator:
                         proposed_command=report_cmd,
                         action_output=json.dumps(executed_status)
                     )
-                    append_incident_to_graph_doc(
-                        service=project_tag,
-                        title=f"Autonomous Healing: {project_tag}",
-                        status="resolved" if all_ok else "failed",
-                        proposed_command=report_cmd,
-                        success=all_ok
-                    )
 
                 elif risk_level in ("Low", "Medium"):
                     # Non-autonomous but low/medium: still auto-execute
@@ -1264,11 +866,6 @@ class HealingOrchestrator:
                     executed_status = self.execute_approved_actions(actions, 0)
                     duration = time.time() - start_time
                     all_ok = all(e.get("status") == "success" for e in executed_status)
-                    # ── REGISTRY KAYIT ────────────────────────────────────────────────────
-                    if actions:
-                        register_actions_in_registry(DB_PATH, _error_hash, actions, success=all_ok)
-                        logger.info(f"[REGISTRY] {len(actions)} aksiyon kaydedildi (success={all_ok}, hash={_error_hash})")
-                    # ── REGISTRY KAYIT SONU ───────────────────────────────────────────────
                     
                     if all_ok:
                         send_telegram_text(
@@ -1315,13 +912,6 @@ class HealingOrchestrator:
                         proposed_command=report_cmd,
                         action_output=json.dumps(executed_status)
                     )
-                    append_incident_to_graph_doc(
-                        service=project_tag,
-                        title=f"Auto-remount Healing: {project_tag}",
-                        status="resolved" if all_ok else "failed",
-                        proposed_command=report_cmd,
-                        success=all_ok
-                    )
                 else:
                     # High/Critical + not autonomous → HITL Telegram approval
                     action_id = add_pending_action(err_hash, risk_level, actions)
@@ -1355,22 +945,8 @@ class HealingOrchestrator:
         for act in actions:
             act_type = act.get("type", "")
             target = act.get("target", "")
-            if act_type == "replace":
-                search = act.get("search", "")
-                replace = act.get("replace", "")
-                import difflib
-                diff = list(difflib.unified_diff(
-                    search.splitlines(),
-                    replace.splitlines(),
-                    fromfile="old_code",
-                    tofile="new_code",
-                    lineterm=""
-                ))
-                diff_text = "\n".join(diff[2:])
-                actions_summary += f"• *replace* -> `{md_escape(target)}`:\n```diff\n{diff_text}\n```\n"
-            else:
-                payload_preview = act.get("payload", "")[:100]
-                actions_summary += f"• {md_escape(act_type)} -> {md_escape(target)} ({md_escape(payload_preview)}...)\n"
+            payload_preview = act.get("payload", "")[:100]
+            actions_summary += f"• {md_escape(act_type)} -> {md_escape(target)} ({md_escape(payload_preview)}...)\n"
 
         root_cause = md_escape(data.get("root_cause", ""))
         tag_safe = md_escape(tag)
@@ -1524,33 +1100,14 @@ class HealingOrchestrator:
                 elif act_type == "shell":
                     # Command whitelist filter
                     allowed_patterns = [
-                        r"^docker\\s+compose\\s+(up\\s+-d\\s+--build|restart|up\\s+-d)(\\s+[a-zA-Z0-9_-]+)?$",
-                        r"^docker\\s+restart\\s+[a-zA-Z0-9_-]+$",
-                        r"^systemctl\\s+(restart|start)\\s+[a-zA-Z0-9_.-]+$",
-                        r"^cd\\s+/home/pi/projects/[a-zA-Z0-9_.-]+\\s+&&\\s+docker\\s+compose\\s+(up\\s+-d\\s+--build|restart|up\\s+-d)(\\s+[a-zA-Z0-9_-]+)?$",
+                        r"^docker\s+compose\s+(up\s+-d\s+--build|restart|up\s+-d)(\s+[a-zA-Z0-9_-]+)?$",
+                        r"^docker\s+restart\s+[a-zA-Z0-9_-]+$",
+                        r"^systemctl\s+(restart|start)\s+[a-zA-Z0-9_.-]+$"
                     ]
-                    # Öğrenilmiş dinamik pattern'leri yükle
-                    allowed_patterns += _load_learned_patterns()
                     is_allowed = any(re.match(pat, payload) for pat in allowed_patterns)
-
-                    # Tehlikeli karakter kontrolü — LLM'e bile sormadan reddet
-                    dangerous_chars = any(char in payload for char in [";", "|", "`", "$", chr(10), chr(13)])
-                    if dangerous_chars:
-                        executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "tehlikeli karakter"})
+                    if not is_allowed or any(char in payload for char in [";", "|", "&", "`", "$", "\n", "\r"]):
+                        executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "yasaklı komut"})
                         continue
-
-                    if not is_allowed:
-                        logger.info("[WHITELIST] Whitelist dışı komut — LLM onay zinciri: %s", payload)
-                        approved, new_pattern = llm_approve_for_whitelist(payload, payload)
-                        if approved and new_pattern:
-                            allowed_patterns.append(new_pattern)
-                            _persist_learned_pattern(new_pattern)
-                            is_allowed = True
-                            logger.info("[WHITELIST] LLM onayladı, pattern kaydedildi: %s", new_pattern)
-                        else:
-                            executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "LLM onaylamadı"})
-                            _notify_telegram_rejection(payload, payload)
-                            continue
 
                     try:
                         cmd_args = payload.split()
@@ -1658,144 +1215,6 @@ class HealingOrchestrator:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError as e:
             logger.error("Heal log yazma hatası: %s", str(e))
-
-
-# ── Whitelist LLM Approval (dinamik öğrenen zincir) ──────────
-LEARNED_PATTERNS_FILE = "/home/pi/sre/learned_patterns.json"
-
-def _load_learned_patterns() -> list:
-    """Dosyadan dinamik olarak öğrenilmiş whitelist pattern'lerini yükle."""
-    if os.path.exists(LEARNED_PATTERNS_FILE):
-        try:
-            with open(LEARNED_PATTERNS_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-
-def _persist_learned_pattern(pattern: str):
-    """LLM onayladığı pattern'i kalıcı olarak kaydet."""
-    patterns = _load_learned_patterns()
-    if pattern not in patterns:
-        patterns.append(pattern)
-        with open(LEARNED_PATTERNS_FILE, "w") as f:
-            json.dump(patterns, f, indent=2)
-        logger.info("[WHITELIST] Yeni pattern öğrenildi ve kaydedildi: %s", pattern)
-
-def llm_approve_for_whitelist(payload: str, context: str) -> tuple:
-    """
-    Cascading LLM zinciri: Ollama 7b → Groq → Gemini
-    Komutun güvenli olup olmadığını ve whitelist regex pattern'ini üretir.
-    Dön: (approved: bool, pattern: str | None)
-    """
-    prompt = (
-        "Sen bir Linux güvenlik uzmanısın. Bir SRE daemon'ı şu komutu çalıştırmak istiyor:\n\n"
-        f"KOMUT: {payload}\n"
-        f"BAĞLAM: {context[:300]}\n\n"
-        "Görevin:\n"
-        "1. Bu komut gerçekten güvenli mi?\n"
-        "2. Güvenliyse, bu komutu kapsayan minimal bir Python regex pattern üret.\n\n"
-        "Tehlikeli (reddet): rm, wget, curl, pip install, apt, chmod, chown, echo > dosya\n"
-        "Güvenli: docker compose up/restart, docker restart, systemctl restart/start\n\n"
-        "Yanıtı SADECE JSON formatında ver, başka hiçbir şey yazma:\n"
-        '{"approved": true, "pattern": "^regex_pattern$", "reason": "kısa açıklama"}'
-    )
-
-    def _parse_json_response(text: str) -> dict:
-        text = text.strip()
-        text = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
-        m = re.search(r"\{.*?\}", text, re.DOTALL)
-        if m:
-            return json.loads(m.group())
-        return json.loads(text)
-
-    # 1. Local Ollama (Pi 7b — hızlı, ücretsiz, $0)
-    try:
-        r = requests.post("http://localhost:11434/api/generate", json={
-            "model": os.getenv("OLLAMA_MODEL_FAST", "qwen2.5-coder:7b"),
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.05, "num_predict": 300}
-        }, timeout=90)  # timeout 90 saniyeye çekildi (Pi 5 model yükleme toleransı)
-        r.raise_for_status()
-        result = _parse_json_response(r.json().get("response", ""))
-        if result.get("approved") and result.get("pattern"):
-            logger.info("[WHITELIST-LLM] Ollama 7b onayladı → pattern: %s", result["pattern"])
-            return True, result["pattern"]
-        if result.get("approved") is False:
-            logger.warning("[WHITELIST-LLM] Ollama 7b reddetti → sebep: %s", result.get("reason"))
-            return False, None
-    except Exception as e:
-        logger.warning("[WHITELIST-LLM] Ollama başarısız, Groq deneniyor: %s", e)
-
-    # 2. Groq fallback (ücretsiz, hızlı)
-    try:
-        groq_key = os.getenv("GROQ_API_KEY", "")
-        if groq_key:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 300, "temperature": 0.05
-                },
-                timeout=20)
-            r.raise_for_status()
-            result = _parse_json_response(r.json()["choices"][0]["message"]["content"])
-            if result.get("approved") and result.get("pattern"):
-                logger.info("[WHITELIST-LLM] Groq onayladı → pattern: %s", result["pattern"])
-                return True, result["pattern"]
-            if result.get("approved") is False:
-                logger.warning("[WHITELIST-LLM] Groq reddetti → sebep: %s", result.get("reason"))
-                return False, None
-        else:
-            logger.warning("[WHITELIST-LLM] GROQ_API_KEY bulunamadı, atlanıyor.")
-    except Exception as e:
-        logger.warning("[WHITELIST-LLM] Groq başarısız, Gemini deneniyor: %s", e)
-
-    # 3. Gemini fallback
-    try:
-        gemini_key = os.getenv("GEMINI_API_KEY", "")
-        if gemini_key:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}",
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=20)
-            r.raise_for_status()
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            result = _parse_json_response(text)
-            if result.get("approved") and result.get("pattern"):
-                logger.info("[WHITELIST-LLM] Gemini onayladı → pattern: %s", result["pattern"])
-                return True, result["pattern"]
-            if result.get("approved") is False:
-                logger.warning("[WHITELIST-LLM] Gemini reddetti → sebep: %s", result.get("reason"))
-                return False, None
-        else:
-            logger.warning("[WHITELIST-LLM] GEMINI_API_KEY bulunamadı, atlanıyor.")
-    except Exception as e:
-        logger.warning("[WHITELIST-LLM] Gemini başarısız: %s", e)
-
-    logger.error("[WHITELIST-LLM] Tüm zincir başarısız — komut güvenlik engelinde.")
-    return False, None
-
-def _notify_telegram_rejection(payload: str, context: str):
-    """Whitelist LLM zincirinin de reddettiği komutu Telegram'a bildir."""
-    try:
-        token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-        if token and chat_id:
-            msg = (
-                "⚠️ *Whitelist Reddi — Manuel İnceleme Gerekiyor*\n\n"
-                f"Komut LLM tarafından da onaylanmadı:\n`{payload}`\n\n"
-                f"Bağlam:\n`{context[:250]}`"
-            )
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
-                timeout=10)
-    except Exception as e:
-        logger.error("[WHITELIST-LLM] Telegram rejection bildirimi başarısız: %s", e)
 
 def run_approved_actions(actions: List[Dict[str, Any]], action_id: int):
     orchestrator = HealingOrchestrator()
@@ -2096,8 +1515,8 @@ def main():
     orchestrator = HealingOrchestrator()
 
     # Start watchers
-    journal_watcher = JournalWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, NOISE_PATTERNS, register_discovered_service)
-    docker_watcher  = DockerWatcher(rate_limiter, orchestrator.handle_error, PROJECT_MAP, DOCKER_BURST_LIMIT, register_discovered_service)
+    journal_watcher = JournalWatcher(rate_limiter, orchestrator.handle_error)
+    docker_watcher  = DockerWatcher(rate_limiter, orchestrator.handle_error)
     journal_watcher.start()
     docker_watcher.start()
 
