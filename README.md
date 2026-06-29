@@ -61,7 +61,7 @@ Raspberry Pi 5
             ├── 2. Local Pi Ollama (Fast)    --> qwen2.5-coder:7b (Offline Fallback / Free)
             ├── 3. Groq Cloud API            --> llama-3.3-70b-versatile (Fast / Free)
             ├── 4. Google Gemini API         --> gemini-2.0-flash / 2.5-flash (Cloud / Free)
-            └── 5. Anthropic Claude API      --> claude-sonnet-4-6 (Son Çare / Expensive)
+            └── 5. Anthropic Claude API      --> claude-sonnet-4-6 (Last Resort / Expensive)
 ```
 
 ---
@@ -75,7 +75,7 @@ Raspberry Pi 5
    - Traceback signatures (SHA-256 hashes) and their successful resolution commands are saved in `sre_state.db`.
    - When the same incident recurs, the daemon skips the LLM stack entirely and executes the cached fix directly ($0.0000 API cost).
    - **Cross-Container Generalization:** Sanitizes container/service names and syslogs so similar failures across different containers share the same cached strategies.
-   - **Weight Decay:** Over time, the reliability weight of a cached strategy is decayed ($W_{decayed} = W_{base} \times 0.5^{(\text{age\_days}/30)}$). If a cached strategy fails, its weight is reduced, and it gets automatically blacklisted if the weight falls below zero.
+   - **Weight Decay:** Over time, the reliability weight of a cached strategy is decayed (W_decayed = W_base × 0.5^(age_days/30)). If a cached strategy fails, its weight is reduced, and it gets automatically blacklisted if the weight falls below zero.
 5. **Dynamic Whitelist Filter**:
    - Safe commands (e.g. `docker restart`) run immediately via predefined regex matches.
    - Unrecognized commands are piped through the `llm_approve_for_whitelist` chain. If approved as safe, a minimal regex pattern is generated and persisted to `learned_patterns.json`.
