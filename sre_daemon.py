@@ -135,7 +135,7 @@ except ImportError:
         def start(self): pass
         def stop(self): pass
 
-log_dir = Path("/home/pi/sre")
+log_dir = INSTALL_DIR
 log_path = log_dir / "daemon.log" if log_dir.exists() else Path("daemon.log")
 
 logging.basicConfig(
@@ -176,7 +176,8 @@ def atomic_write_text(target: Path, content: str):
 
     os.replace(tmp_path, target)
 
-def cleanup_old_prefix_tags(repo_path="/home/pi/sre", prefix="pre-fix-", max_age_hours=24):
+def cleanup_old_prefix_tags(repo_path=None, prefix="pre-fix-", max_age_hours=24):
+    if not repo_path: repo_path = str(INSTALL_DIR)
     try:
         res = subprocess.run(
             ["git", "-C", repo_path, "tag", "--list", f"{prefix}*"],
@@ -588,7 +589,7 @@ def register_discovered_service(service_name: str, tag: str, is_docker: bool = F
 def append_incident_to_graph_doc(service: str, title: str, status: str, proposed_command: str, success: bool):
     """Appends incident details to sre_incidents.md to trigger graphify-watch updates."""
     try:
-        incident_file = Path("/home/pi/sre/sre_incidents.md")
+        incident_file = INSTALL_DIR / "sre_incidents.md"
         if not incident_file.parent.exists():
             incident_file = Path("sre_incidents.md")
         
@@ -1551,6 +1552,16 @@ class HealingOrchestrator:
                             if t == "__DETECTED_BY_SRE__" or not t or not os.path.exists(t):
                                 act["target"] = detected_target_file
                                 logger.info("[LAYER3] target override → %s", detected_target_file)
+                else:
+                    # If target is __DETECTED_BY_SRE__ but traceback wasn't resolved, drop those code patch actions
+                    filtered_actions = []
+                    for act in actions:
+                        t = act.get("target", "")
+                        if act.get("type") in ("replace", "write", "append") and t == "__DETECTED_BY_SRE__":
+                            logger.warning("[HEAL] Dropped action targeting __DETECTED_BY_SRE__ because no traceback file was resolved: %s", act)
+                            continue
+                        filtered_actions.append(act)
+                    actions = filtered_actions
                 # ── LAYER 3: target override end ─────────────────────────────
 
                 risk_level = self._classify_risk(actions)
@@ -1798,7 +1809,7 @@ class HealingOrchestrator:
                 return [{"status": "rejected", "reason": "self-fix already in progress"}]
             try:
                 # Git Tag backup point creation before modifications
-                subprocess.run(["git", "-C", "/home/pi/sre", "tag", "-a", tag_name, "-m", f"SRE pre-fix backup {timestamp}"], check=True)
+                subprocess.run(["git", "-C", str(INSTALL_DIR), "tag", "-a", tag_name, "-m", f"SRE pre-fix backup {timestamp}"], check=True)
                 logger.info("Kritik self-fix yedekleme etiketi oluşturuldu: %s", tag_name)
             except Exception as e:
                 logger.error("Git tag oluşturma hatası: %s", str(e))
@@ -1811,10 +1822,22 @@ class HealingOrchestrator:
                 target   = act.get("target", "").strip()
                 payload  = act.get("payload", "")
 
-                # Security target normalization check
+                # Security target normalization check (dynamic and platform-agnostic)
                 if target:
                     target_path = Path(target).resolve()
-                    if not str(target_path).startswith("/home/pi/") or ".." in target or "/sre/.env" in target:
+                    target_str = str(target_path)
+                    
+                    # Dynamically allow installation dir, user home, and service project directories
+                    allowed_dirs = {str(INSTALL_DIR.resolve()), str(Path.home().resolve())}
+                    for svc in self.manifest.services:
+                        for k in ("compose_file", "unit", "app_name"):
+                            v = svc.get(k)
+                            if v and "/" in v:
+                                allowed_dirs.add(str(Path(v).parent.resolve()))
+                                
+                    is_safe = any(target_str.startswith(d) for d in allowed_dirs)
+                    
+                    if not is_safe or ".." in target or ".env" in target:
                         logger.warning("Güvenlik engeli: hedef dizin geçersiz veya yasaklı: %s", target)
                         executed.append({"status": "rejected", "reason": "hedef güvenlik engeli"})
                         continue
@@ -1983,16 +2006,16 @@ class HealingOrchestrator:
                 if success_count == len(actions):
                     # Commit SRE self-fix changes
                     try:
-                        subprocess.run(["git", "-C", "/home/pi/sre", "add", "-A"], check=True)
-                        diff_check = subprocess.run(["git", "-C", "/home/pi/sre", "diff", "--cached", "--quiet"])
+                        subprocess.run(["git", "-C", str(INSTALL_DIR), "add", "-A"], check=True)
+                        diff_check = subprocess.run(["git", "-C", str(INSTALL_DIR), "diff", "--cached", "--quiet"])
                         if diff_check.returncode == 0:
                             raise ValueError("Commitlenecek değişiklik yok")
-                        subprocess.run(["git", "-C", "/home/pi/sre", "commit", "-m", f"SRE self-fix: {timestamp}"], check=True)
+                        subprocess.run(["git", "-C", str(INSTALL_DIR), "commit", "-m", f"SRE self-fix: {timestamp}"], check=True)
                         logger.info("SRE self-fix başarıyla commit edildi.")
                     except Exception as e:
                         logger.error("Git commit hatası: %s", str(e))
-                        subprocess.run(["git", "-C", "/home/pi/sre", "reset", "--hard", tag_name], capture_output=True)
-                        subprocess.run(["git", "-C", "/home/pi/sre", "tag", "-d", tag_name], capture_output=True)
+                        subprocess.run(["git", "-C", str(INSTALL_DIR), "reset", "--hard", tag_name], capture_output=True)
+                        subprocess.run(["git", "-C", str(INSTALL_DIR), "tag", "-d", tag_name], capture_output=True)
                         return executed + [{"status": "failed", "error": f"git commit failed: {e}"}]
                     
                     # Detached Watchdog Spawning with MainPID and heartbeat checks
@@ -2005,7 +2028,7 @@ class HealingOrchestrator:
                       ACTIVE2="\$(/usr/bin/systemctl is-active sre-daemon)"
                       
                       # Heartbeat modify check
-                      MOD_TIME=\$(stat -c %Y /home/pi/sre/.heartbeat 2>/dev/null || echo 0)
+                      MOD_TIME=\$(stat -c %Y {HEARTBEAT_PATH} 2>/dev/null || echo 0)
                       NOW=\$(date +%s)
                       HEARTBEAT_AGE=\$((NOW - MOD_TIME))
 
@@ -2013,13 +2036,13 @@ class HealingOrchestrator:
                          [ "\$ACTIVE1" = "active" ] && [ "\$ACTIVE2" = "active" ] && \
                          [ "\$PID1" -eq "\$PID2" ] && [ "\$PID1" -ne 0 ] && \
                          [ \$HEARTBEAT_AGE -lt 15 ]; then
-                        echo "Stabilization check passed." >> /home/pi/sre/watchdog.log
+                        echo "Stabilization check passed." >> {INSTALL_DIR / 'watchdog.log'}
                       else
-                        echo "Unstable service detected. Rolling back..." >> /home/pi/sre/watchdog.log
-                        echo "Rollback to {tag_name}" > /home/pi/sre/watchdog_rollback.flag
-                        git -C /home/pi/sre reset --hard {tag_name} >> /home/pi/sre/watchdog.log 2>&1
-                        sudo /usr/bin/systemctl restart sre-daemon >> /home/pi/sre/watchdog.log 2>&1
-                        git -C /home/pi/sre tag -d {tag_name} >> /home/pi/sre/watchdog.log 2>&1
+                        echo "Unstable service detected. Rolling back..." >> {INSTALL_DIR / 'watchdog.log'}
+                        echo "Rollback to {tag_name}" > {INSTALL_DIR / 'watchdog_rollback.flag'}
+                        git -C {INSTALL_DIR} reset --hard {tag_name} >> {INSTALL_DIR / 'watchdog.log'} 2>&1
+                        sudo /usr/bin/systemctl restart sre-daemon >> {INSTALL_DIR / 'watchdog.log'} 2>&1
+                        git -C {INSTALL_DIR} tag -d {tag_name} >> {INSTALL_DIR / 'watchdog.log'} 2>&1
                         curl -s -X POST "https://api.telegram.org/bot\${{TELEGRAM_BOT_TOKEN}}/sendMessage" \
                           -d "chat_id=\${{TELEGRAM_CHAT_ID}}" \
                           -d "text=⚠️ *SRE Watchdog*: Rollback tetiklendi! Servis stabilize olamadı, {tag_name} etiketine geri dönüldü." \
@@ -2046,8 +2069,8 @@ class HealingOrchestrator:
                     subprocess.Popen(["sudo", "/usr/bin/systemctl", "restart", "sre-daemon"])
                 else:
                     logger.warning("Tüm self-fix eylemleri başarılı olamadı, rollback yapılıyor...")
-                    subprocess.run(["git", "-C", "/home/pi/sre", "reset", "--hard", tag_name], capture_output=True)
-                    subprocess.run(["git", "-C", "/home/pi/sre", "tag", "-d", tag_name], capture_output=True)
+                    subprocess.run(["git", "-C", str(INSTALL_DIR), "reset", "--hard", tag_name], capture_output=True)
+                    subprocess.run(["git", "-C", str(INSTALL_DIR), "tag", "-d", tag_name], capture_output=True)
             return executed
         finally:
             if is_self_fix and SELF_FIX_LOCK.locked():
@@ -2074,7 +2097,7 @@ class HealingOrchestrator:
 
 
 # ── Whitelist LLM Approval (dinamik öğrenen zincir) ──────────
-LEARNED_PATTERNS_FILE = "/home/pi/sre/learned_patterns.json"
+LEARNED_PATTERNS_FILE = str(INSTALL_DIR / "learned_patterns.json")
 
 def _load_learned_patterns() -> list:
     """Dosyadan dinamik olarak öğrenilmiş whitelist pattern'lerini yükle."""
@@ -2467,7 +2490,7 @@ def start_self_monitor():
         return
         
     def _run():
-        log_path = Path("/home/pi/sre/daemon.log")
+        log_path = INSTALL_DIR / "daemon.log"
         last_pos = 0
         if log_path.exists():
             last_pos = log_path.stat().st_size
