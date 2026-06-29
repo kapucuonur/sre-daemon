@@ -21,13 +21,13 @@ Depending on your subscription plan, install SRE Daemon using one of the followi
 ### Option A: Starter Tier (Self-Hosted Free)
 Runs entirely locally using your own infrastructure and configuration:
 ```bash
-curl -sSL https://sre-daemon.com/install.sh | bash
+curl -sSL https://sre.trihonor.com/install.sh | bash
 ```
 
 ### Option B: Pro / Scale Tiers (Managed Dashboard)
 Unlocks the hosted **SRE Platform Dashboard**, managed updates, and shared cloud LLM budgets:
 ```bash
-curl -sSL https://sre-daemon.com/install.sh | SRE_API_KEY=sre_live_xxxxxxxxxxxxxxxx bash
+curl -sSL https://sre.trihonor.com/install.sh | SRE_API_KEY=sre_live_xxxxxxxxxxxxxxxx bash
 ```
 
 ---
@@ -37,7 +37,7 @@ curl -sSL https://sre-daemon.com/install.sh | SRE_API_KEY=sre_live_xxxxxxxxxxxxx
 * **AI SRE (Site Reliability Engineer)**: An autonomous software agent that monitors system logs and Docker containers 24/7 to analyze and repair infrastructure issues automatically.
 * **Human-in-the-Loop (HITL)**: A safety gate pattern where the AI proposes a code patch or system change, but awaits explicit human confirmation (via interactive Telegram buttons or Slack actions) before executing it in production.
 * **Stateless Retries**: A reliable failover pattern where each fallback model in the stack is initialized with the original, raw error log. If a model fails or halts, the next fallback starts with a clean slate, preventing the propagation of incorrect assumptions.
-* **Dinamik Whitelist Öğrenme**: Sabit kurallarla sınırlı kalmayan, güvenlik kurallarına uygun whitelist onay sürecinin LLM katmanları tarafından otonom olarak regex pattern'lerine dönüştürülüp kalıcı olarak kaydedilmesi.
+* **Dynamic Whitelist Learning**: A self-learning execution security layer that automatically translates validated, non-malicious command exceptions into regex rules via LLMs and persists them to `learned_patterns.json`.
 
 ---
 
@@ -56,13 +56,12 @@ Raspberry Pi 5
       │
       ├── 3. Dynamic Whitelist Learning Engine (learned_patterns.json)
       │
-      └── 4. 6-Tier Hierarchical LLM Fallback Stack
-            ├── 1. Local Pi Ollama (Fast)    --> qwen2.5-coder:7b (Offline / Free)
-            ├── 2. Local Pi Ollama (Deep)    --> qwen2.5-coder:32b (Offline / Free)
-            ├── 3. MacBook Ollama (Network)  --> qwen2.5-coder:32b (Heavy Local / Free)
-            ├── 4. Groq Cloud API            --> llama-3.3-70b-versatile (Hızlı / Free)
-            ├── 5. Google Gemini API         --> gemini-2.0-flash / 2.5-flash (Cloud / Free)
-            └── 6. Anthropic Claude API      --> claude-sonnet-4-5 / 4-6 (Son Çare / Ücretli)
+      └── 4. 5-Tier Hierarchical LLM Fallback Stack
+            ├── 1. MacBook Ollama (Network) --> qwen2.5-coder:32b (Heavy Local / Free)
+            ├── 2. Local Pi Ollama (Fast)    --> qwen2.5-coder:7b (Offline Fallback / Free)
+            ├── 3. Groq Cloud API            --> llama-3.3-70b-versatile (Fast / Free)
+            ├── 4. Google Gemini API         --> gemini-2.0-flash / 2.5-flash (Cloud / Free)
+            └── 5. Anthropic Claude API      --> claude-sonnet-4-6 (Son Çare / Expensive)
 ```
 
 ---
@@ -72,25 +71,25 @@ Raspberry Pi 5
 1. **Monitor**: `systemd journal` and Docker events are monitored in real-time.
 2. **Detection**: Errors and container crashes are captured and filtered.
 3. **Analysis**: The error is sent to the hierarchical LLM pipeline. The first active model analyzes the error, identifies the root cause, and generates a remediation action plan (`actions`).
-4. **Strategy Registry (Otonom Hafıza)**:
-   - Başarıyla çözülen hataların traceback imzası (SHA-256) ve çözüm komutları SQLite veritabanında saklanır.
-   - Aynı hata tekrar oluştuğunda LLM zincirine hiç istek atılmadan doğrudan hafızadaki komut çalıştırılır ($0.0000 API maliyeti).
-   - **Cross-Container Genelleme:** Hata loglarındaki container/servis isimleri temizlenerek aynı hata tiplerinin tüm altyapıda ortak çözülmesi sağlanır.
-   - **Zaman Bazlı Çürüme (Weight Decay):** Çözümlerin başarı puanları zamanla çürütülür ($W_{decayed} = W_{base} \times 0.5^{(\text{age\_days}/30)}$). Başarısız olan çözümler otomatik olarak kara listeye alınır.
-5. **Dinamik Whitelist Kontrolü**:
-   - Güvenli komutlar (örn: `docker restart`) doğrudan whitelist ile eşleşerek çalışır.
-   - Whitelist dışındaki komutlar LLM onay zincirine (`llm_approve_for_whitelist`) gönderilir. Güvenli bulunursa otomatik olarak yeni bir regex kuralı öğrenilir ve `learned_patterns.json` dosyasına eklenir.
-   - Tehlikeli karakter filtresi (`|`, `;`, `$`, vb.) barındıran komutlar LLM'e gitmeden doğrudan engellenir.
-6. **Approval & Remediation**: Kritik riskli komutlar SQLite veritabanına kaydedilerek Telegram ve Slack onay butonlarına sunulur. Onay sonrası atomik olarak test edilip uygulanır.
-7. **Watchdog Protection**: Eğer daemon kilitlenirse bağımsız watchdog otomatik olarak `git rollback` tetikler ve servisi yeniden başlatır.
+4. **Strategy Registry (Autonomous Memory)**:
+   - Traceback signatures (SHA-256 hashes) and their successful resolution commands are saved in `sre_state.db`.
+   - When the same incident recurs, the daemon skips the LLM stack entirely and executes the cached fix directly ($0.0000 API cost).
+   - **Cross-Container Generalization:** Sanitizes container/service names and syslogs so similar failures across different containers share the same cached strategies.
+   - **Weight Decay:** Over time, the reliability weight of a cached strategy is decayed ($W_{decayed} = W_{base} \times 0.5^{(\text{age\_days}/30)}$). If a cached strategy fails, its weight is reduced, and it gets automatically blacklisted if the weight falls below zero.
+5. **Dynamic Whitelist Filter**:
+   - Safe commands (e.g. `docker restart`) run immediately via predefined regex matches.
+   - Unrecognized commands are piped through the `llm_approve_for_whitelist` chain. If approved as safe, a minimal regex pattern is generated and persisted to `learned_patterns.json`.
+   - Commands containing dangerous characters (`|`, `;`, `$`, etc.) are blocked immediately without query to the LLM.
+6. **Approval & Remediation**: Critical/high-risk commands are saved to the SQLite state store and forwarded as interactive block actions to Slack and Telegram. Once approved, the patch is atomically verified and applied.
+7. **Watchdog Protection**: If the daemon locks up, the independent watchdog triggers a `git rollback` and restarts the service.
 
 ---
 
 ## 📊 Monitoring & Alerts (ai_log_analyst.py)
 
-Sistem genelindeki logların durumunu periyodik olarak kontrol eden bağımsız bir log analizörüdür (`ai_log_analyst.py`).
-- Her 30 dakikada bir çalışarak sistem log dosyalarını (`/home/pi/sre/daemon.log` vb.) ve Docker loglarını analiz eder.
-- Olağandışı durumları saptayarak Telegram ve Slack üzerinden anında bildirim gönderir.
+An independent background log monitor (`ai_log_analyst.py`) runs periodically via cron.
+- Analyzes system logs (`/home/pi/sre/daemon.log` etc.) and Docker logs over the last 30 minutes.
+- Detects unusual patterns or errors and dispatches notifications via Slack and Telegram.
 
 ---
 
@@ -99,7 +98,7 @@ Sistem genelindeki logların durumunu periyodik olarak kontrol eden bağımsız 
 | Feature | Description |
 | :--- | :--- |
 | **SQLite HITL State Store** | Persistently tracks pending approvals, surviving crashes and service restarts. |
-| **6-Tier LLM Pipeline** | Hierarchical fallback starting from ultra-fast local Ollama on Pi 5, scaling to Groq, Gemini and falling back to Claude Sonnet to minimize API costs. |
+| **5-Tier LLM Pipeline** | Hierarchical fallback starting from heavy local Ollama on Mac, scaling to local Pi, Groq, Gemini and falling back to Claude Sonnet to minimize API costs. |
 | **Strategy Registry** | Learns successful healing commands and replicates them instantly without LLM calls. Includes Weight Decay algorithm. |
 | **Dynamic Whitelist Learning** | Self-learning execution security layer which generates regex patterns for approved commands dynamically. |
 | **ChatOps Integration** | Full Telegram buttons and Slack interactive action handlers for quick remote infrastructure administration. |
