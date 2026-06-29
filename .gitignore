@@ -36,3 +36,5 @@ Thumbs.db
 *.mp4
 *.mov
 *.gif
+graphify-out/
+.agents/
