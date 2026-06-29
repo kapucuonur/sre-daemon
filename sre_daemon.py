@@ -636,6 +636,101 @@ def start_heartbeat():
     t.start()
 
 # ── Rate Limiter ─────────────────────────────────────────────
+
+# ── File Editor & Patch Validation Sandbox ───────────────────
+class FileEditor:
+    """
+    SRE Daemon File Management, Syntax Validation & Safe Patching Sandbox
+    """
+    def __init__(self):
+        pass
+
+    def read_file(self, file_path: str, start_line: int = 1, end_line: int = None) -> str:
+        try:
+            if not os.path.exists(file_path):
+                return f"Error: File {file_path} not found"
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            
+            end_line = end_line or len(lines)
+            selected = lines[start_line-1:end_line]
+            return "".join(selected)
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+    def write_file(self, file_path: str, content: str) -> None:
+        """Atomically writes content to the target file."""
+        temp_path = file_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(temp_path, file_path)
+
+    def validate_syntax(self, file_path: str) -> tuple:
+        """
+        Validates python file syntax using py_compile.
+        Returns: (is_valid: bool, error_message: str)
+        """
+        if not file_path.endswith(".py"):
+            return True, ""
+        try:
+            import py_compile
+            py_compile.compile(file_path, doraise=True)
+            return True, ""
+        except py_compile.PyCompileError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, str(e)
+
+    def apply_patch(self, file_path: str, search_block: str, replace_block: str, dry_run: bool = False) -> tuple:
+        """
+        Attempts to apply a search-and-replace block, validates compile syntax, 
+        and rolls back if syntax validation fails.
+        Returns: (success: bool, detail: str)
+        """
+        try:
+            if not os.path.exists(file_path):
+                return False, f"File {file_path} not found"
+            
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            if search_block not in content:
+                # Try with normalized whitespace if exact match fails
+                normalized_content = re.sub(r"\s+", " ", content)
+                normalized_search = re.sub(r"\s+", " ", search_block)
+                if normalized_search not in normalized_content:
+                    return False, "Search block not found in file content"
+
+            # Perform substitution
+            patched_content = content.replace(search_block, replace_block)
+
+            # Sandbox validation via temp file
+            temp_test_path = file_path + "_test_patch.py"
+            with open(temp_test_path, "w", encoding="utf-8") as f:
+                f.write(patched_content)
+
+            is_valid, err_msg = self.validate_syntax(temp_test_path)
+            if os.path.exists(temp_test_path):
+                os.unlink(temp_test_path)
+
+            if not is_valid:
+                return False, f"Syntax validation failed: {err_msg}"
+
+            if not dry_run:
+                # Create backup
+                backup_path = file_path + ".bak"
+                with open(backup_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
+                # Write patched file atomically
+                self.write_file(file_path, patched_content)
+                return True, "Patch applied and verified successfully"
+            
+            return True, "Dry-run validation successful"
+            
+        except Exception as e:
+            return False, f"Patch failed: {e}"
+
 class RateLimiter:
     def __init__(self):
         self._seen: dict[str, float] = {}
@@ -785,6 +880,7 @@ class HealingOrchestrator:
         self.groq         = GroqClient()
         self.xai          = XAIClient()
         self.anthropic    = AnthropicClient()
+        self.file_editor  = FileEditor()
 
     def handle_error(self, tagged_line: str, project_tag: str, err_hash: str = None):
         if not err_hash:
@@ -841,7 +937,7 @@ class HealingOrchestrator:
             f"Sistem: Raspberry Pi 5 | Proje/Servis: {project_name}\n\n"
             "Pi üzerindeki bilinen proje dizinleri ve docker-compose yolları şunlardır:\n"
             "- BikeFit-API (bikefit-api): Proje dizini: /home/pi/bikefit-api | docker-compose dizini: /home/pi/bikefit (docker-compose.yml burada yer alır)\n"
-            "- AI-Coach (coachonurai-api): Proje dizini: /home/pi/projects/AI-Coach | docker-compose dizini: /home/pi/projects/AI-Coach (docker-compose.yml burada yer alır)\n"
+            "- AI-Coach (api): Proje dizini: /home/pi/projects/AI-Coach | docker-compose dizini: /home/pi/projects/AI-Coach (docker-compose.yml burada yer alır)\n"
             "- TriHonor-API (trihonor-api-prod): Proje dizini: /home/pi/TriHonor-API | docker-compose dizini: /home/pi/TriHonor-API (docker-compose.prod.yml burada yer alır)\n"
             f"{past_context}\n"
             "Aşağıdaki sistem hata mesajını analiz et:\n"
