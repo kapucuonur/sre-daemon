@@ -567,6 +567,27 @@ def main():
     if has_problem:
         print(f"⚠️ Sorun tespit edildi, Telegram'a bildiriliyor...")
         send_telegram(report)
+        # SRE Daemon için DB'ye yaz
+        try:
+            import sqlite3 as _sqlite3
+            db_path = "/home/pi/sre/sre_state.db"
+            with _sqlite3.connect(db_path) as _conn:
+                _conn.execute("""
+                    CREATE TABLE IF NOT EXISTS analyst_insights (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT NOT NULL,
+                        report TEXT NOT NULL,
+                        consumed INTEGER DEFAULT 0
+                    )
+                """)
+                _conn.execute(
+                    "INSERT INTO analyst_insights (created_at, report, consumed) VALUES (?, ?, 0)",
+                    (datetime.now().isoformat(), report)
+                )
+                _conn.commit()
+            print("✅ Insight DB'ye kaydedildi.")
+        except Exception as e:
+            print(f"DB yazma hatası: {e}")
     else:
         print("✅ Sistem sağlıklı, bildirim gönderilmedi.")
     
