@@ -2135,3 +2135,12 @@ if __name__ == "__main__":
         print("self-test-ok")
         sys.exit(0)
     main()
+
+def git_auto_sync():
+    import subprocess
+    try:
+        subprocess.run(["git", "add", "."], check=True)
+        subprocess.run(["git", "commit", "-m", "Auto-sync: Incident recorded"], check=True)
+        subprocess.run(["git", "push", "origin", "main"], check=True)
+    except Exception as e:
+        print(f"Git Sync Hatası: {e}")
