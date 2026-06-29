@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/Raspberry%20Pi-5-C11A41.svg?logo=Raspberry%20Pi&style=flat-square" alt="Raspberry Pi" />
   <img src="https://img.shields.io/badge/Ollama-Local%20First-FC7E0F.svg?style=flat-square" alt="Ollama" />
   <img src="https://img.shields.io/badge/Groq-Llama%203.3-f55036.svg?style=flat-square" alt="Groq Llama 3.3" />
-  <img src="https://img.shields.io/badge/Gemini-2.0%20Flash-4285F4.svg?logo=Google&style=flat-square" alt="Gemini 2.0" />
+  <img src="https://img.shields.io/badge/Gemini-2.5%20Flash-4285F4.svg?logo=Google&style=flat-square" alt="Gemini 2.5" />
   <img src="https://img.shields.io/badge/Claude-Sonnet-d97706.svg?style=flat-square" alt="Claude Sonnet" />
   <img src="https://img.shields.io/badge/License-Proprietary-blue.svg?style=flat-square" alt="License" />
 </p>
@@ -64,8 +64,8 @@ Raspberry Pi 5
             ├── 1. MacBook Ollama (Network) --> qwen2.5-coder:32b (Heavy Local / Free)
             ├── 2. Local Pi Ollama (Fast)    --> qwen2.5-coder:7b (Offline Fallback / Free)
             ├── 3. Groq Cloud API            --> llama-3.3-70b-versatile (Fast / Free)
-            ├── 4. Google Gemini API         --> gemini-2.0-flash / 2.5-flash (Cloud / Free)
-            └── 5. Anthropic Claude API      --> claude-sonnet-4-6 (Son Çare / Expensive)
+            ├── 4. Google Gemini API         --> gemini-2.5-flash (Cloud / Free)
+            └── 5. Anthropic Claude API      --> claude-sonnet-4-6 (Last Resort / Expensive)
 ```
 
 ---
@@ -74,17 +74,24 @@ Raspberry Pi 5
 
 1. **Monitor**: `systemd journal` and Docker events are monitored in real-time.
 2. **Detection**: Errors and container crashes are captured and filtered.
-3. **Analysis**: The error is sent to the hierarchical LLM pipeline. The first active model analyzes the error, identifies the root cause, and generates a remediation action plan (`actions`).
+3. **Analysis & Diagnostics (Layer 2)**:
+   - SRE Daemon dynamically parses python stack tracebacks.
+   - Automatically translates container-internal paths (e.g. `/app/main.py`) to physical host paths (e.g. `/home/pi/bikefit-api/main.py`) using service location translation rules.
+   - Extracts a **50-line surrounding code context** using the `FileEditor` utility and attaches it directly to the prompt.
+   - The first active model in the LLM pipeline analyzes this code context and the log traceback to generate a precise yama action plan (`replace` or `write` commands).
 4. **Strategy Registry (Autonomous Memory)**:
    - Traceback signatures (SHA-256 hashes) and their successful resolution commands are saved in `sre_state.db`.
    - When the same incident recurs, the daemon skips the LLM stack entirely and executes the cached fix directly ($0.0000 API cost).
    - **Cross-Container Generalization:** Sanitizes container/service names and syslogs so similar failures across different containers share the same cached strategies.
-   - **Weight Decay:** Over time, the reliability weight of a cached strategy is decayed ($W_{decayed} = W_{base} \times 0.5^{(\text{age\_days}/30)}$). If a cached strategy fails, its weight is reduced, and it gets automatically blacklisted if the weight falls below zero.
+   - **Weight Decay:** Over time, the reliability weight of a cached strategy is decayed (W_decayed = W_base × 0.5^(age_days/30)). If a cached strategy fails, its weight is reduced, and it gets automatically blacklisted if the weight falls below zero.
 5. **Dynamic Whitelist Filter**:
    - Safe commands (e.g. `docker restart`) run immediately via predefined regex matches.
    - Unrecognized commands are piped through the `llm_approve_for_whitelist` chain. If approved as safe, a minimal regex pattern is generated and persisted to `learned_patterns.json`.
    - Commands containing dangerous characters (`|`, `;`, `$`, etc.) are blocked immediately without query to the LLM.
-6. **Approval & Remediation**: Critical/high-risk commands are saved to the SQLite state store and forwarded as interactive block actions to Slack and Telegram. Once approved, the patch is atomically verified and applied.
+6. **HITL & Visual Git Diffs (Layer 3)**:
+   - High-risk yama actions (`replace`) undergo a unified diff comparison (`difflib.unified_diff`).
+   - The exact diff changes (`- old` / `+ new` code lines) are delivered as interactive blocks to Slack and Telegram.
+   - Once approved, the patch is verified for compilation syntax inside a temporary sandbox using `py_compile`. Olası derleme hatalarında orijinal dosya `.bak` yedek kopyasına geri dönerek (`rollback`) sistemi korur.
 7. **Watchdog Protection**: If the daemon locks up, the independent watchdog triggers a `git rollback` and restarts the service.
 
 ---
@@ -105,8 +112,10 @@ An independent background log monitor (`ai_log_analyst.py`) runs periodically vi
 | **5-Tier LLM Pipeline** | Hierarchical fallback starting from heavy local Ollama on Mac, scaling to local Pi, Groq, Gemini and falling back to Claude Sonnet to minimize API costs. |
 | **Strategy Registry** | Learns successful healing commands and replicates them instantly without LLM calls. Includes Weight Decay algorithm. |
 | **Dynamic Whitelist Learning** | Self-learning execution security layer which generates regex patterns for approved commands dynamically. |
+| **Diagnostic Code Parser (Layer 2)** | Extends python tracebacks to extract code file context and translates docker paths dynamically. |
+| **Visual Git Diffs (Layer 3)** | Computes and displays interactive code changes as unified diff inside Telegram notifications. |
+| **Safe Patching Sandbox (Layer 3)** | Atomic write-and-replace using sandbox compile checks and dynamic backups. |
 | **ChatOps Integration** | Full Telegram buttons and Slack interactive action handlers for quick remote infrastructure administration. |
-| **Atomic File Writes** | Patches are validated via `py_compile` and import check, then replaced atomically. |
 | **Independent Watchdog** | Monitors a `.heartbeat` file every 5s. Triggers `git rollback` and restarts the service if the system locks up. |
 
 ---
