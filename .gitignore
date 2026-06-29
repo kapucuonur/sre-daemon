@@ -1,40 +1,28 @@
-# Environment variables & secrets
-.env
-.env.*
-.env.local
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
 
-# Databases & local state
-*.db
+# Daemon runtime & backups
+*.backup
+*.bak
+*.pre_saas_backup
+*.new
+.heartbeat
+heal_log.jsonl
 sre_state.db
 
-# Logs & monitoring
-*.log
+# Environment & secrets
+.env
+*.env.local
+
+# Logs
 daemon.log
-watchdog.log
-heal_log.jsonl
+*.log
+*.jsonl
 
-# Python cache & build directories
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.ipynb_checkpoints/
-venv/
-.venv/
-env/
-
-# OS specific files
+# OS
 .DS_Store
-.DS_Store?
 Thumbs.db
-
-# Local heartbeat and temp files
-.heartbeat
-*.__sre_tmp__*
-
-# Video assets
-*.mp4
-*.mov
-*.gif
-graphify-out/
-.agents/
