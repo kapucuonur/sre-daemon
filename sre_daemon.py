@@ -28,6 +28,21 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import requests
+# ── Load .env manually if it exists (for standalone test / cron compatibility) ──
+def load_env():
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                val = val.strip().strip("'").strip('"')
+                os.environ[key.strip()] = val
+
+load_env()
+
 
 # ── Configuration & Paths ────────────────────────────────────
 MAC_IP            = os.getenv("MAC_IP", "")
@@ -1546,7 +1561,7 @@ def llm_approve_for_whitelist(payload: str, context: str) -> tuple:
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0.05, "num_predict": 300}
-        }, timeout=45)
+        }, timeout=90)  # timeout 90 saniyeye çekildi (Pi 5 model yükleme toleransı)
         r.raise_for_status()
         result = _parse_json_response(r.json().get("response", ""))
         if result.get("approved") and result.get("pattern"):
@@ -1579,6 +1594,8 @@ def llm_approve_for_whitelist(payload: str, context: str) -> tuple:
             if result.get("approved") is False:
                 logger.warning("[WHITELIST-LLM] Groq reddetti → sebep: %s", result.get("reason"))
                 return False, None
+        else:
+            logger.warning("[WHITELIST-LLM] GROQ_API_KEY bulunamadı, atlanıyor.")
     except Exception as e:
         logger.warning("[WHITELIST-LLM] Groq başarısız, Gemini deneniyor: %s", e)
 
@@ -1599,6 +1616,8 @@ def llm_approve_for_whitelist(payload: str, context: str) -> tuple:
             if result.get("approved") is False:
                 logger.warning("[WHITELIST-LLM] Gemini reddetti → sebep: %s", result.get("reason"))
                 return False, None
+        else:
+            logger.warning("[WHITELIST-LLM] GEMINI_API_KEY bulunamadı, atlanıyor.")
     except Exception as e:
         logger.warning("[WHITELIST-LLM] Gemini başarısız: %s", e)
 
@@ -1713,8 +1732,7 @@ def send_telegram_text(chat_id: str, text: str):
 
 def report_incident_to_platform(service: str, title: str, logs: str, status: str, proposed_command: str, action_output: str):
     try:
-        platform_url = os.getenv("SRE_PLATFORM_URL", "http://localhost:8003")
-        url = f"{platform_url.rstrip('/')}/api/daemon/incident"
+        url = "http://localhost:8003/api/daemon/incident"
         payload = {
             "service": service.strip("[]"),
             "title": title[:200],
@@ -1723,12 +1741,7 @@ def report_incident_to_platform(service: str, title: str, logs: str, status: str
             "proposed_command": proposed_command,
             "action_output": action_output
         }
-        headers = {}
-        api_key = os.getenv("SRE_API_KEY")
-        if api_key:
-            headers["X-SRE-API-Key"] = api_key
-            
-        resp = requests.post(url, json=payload, headers=headers, timeout=5)
+        resp = requests.post(url, json=payload, timeout=5)
         if resp.status_code != 200:
             logger.warning("Platforma incident raporlanamadı (kod: %d): %s", resp.status_code, resp.text)
     except Exception as e:
