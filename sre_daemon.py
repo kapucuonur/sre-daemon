@@ -151,6 +151,50 @@ logging.basicConfig(
 logger = logging.getLogger("sre-daemon")
 
 # ── Helper Functions ─────────────────────────────────────────
+# ── Security & Diagnostics Primitives ─────────────────────────
+import ast
+from datetime import datetime, timezone
+import json
+import time
+import requests
+
+def count_ast_nodes(code_string: str) -> int:
+    try:
+        tree = ast.parse(code_string)
+        return len(list(ast.walk(tree)))
+    except:
+        return 0
+
+def log_repair_attempt(incident_id: str, status: str, details: str):
+    log_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "incident_id": incident_id,
+        "status": status,
+        "details": details
+    }
+    with open("repair_history.jsonl", "a") as f:
+        f.write(json.dumps(log_entry) + "\n")
+
+def run_canary_probe(service_url: str) -> bool:
+    try:
+        response = requests.get(service_url, timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+def check_circuit_breaker(failure_count: int) -> bool:
+    return failure_count >= 3
+
+class TenantRateLimiter:
+    def __init__(self, max_calls_per_hour=50):
+        self.max_calls = max_calls_per_hour
+        self.calls = []
+
+    def can_proceed(self) -> bool:
+        now = time.time()
+        self.calls = [c for c in self.calls if now - c < 3600]
+        return len(self.calls) < self.max_calls
+
 def md_escape(text: str) -> str:
     if text is None:
         return ""
@@ -1236,6 +1280,11 @@ class AnthropicClient:
 
 # ── Healing Orchestrator & Action Runner ─────────────────────
 class HealingOrchestrator:
+    def run_safety_checks(self, project_tag, error_hash):
+        if check_circuit_breaker(0): # failure_count mantığını buraya bağlayacağız
+            return False, "Circuit breaker aktif."
+        return True, "Safe"
+
     def __init__(self):
         self.mac_checker      = MacChecker()
         self.ollama           = OllamaClient()
@@ -1360,187 +1409,51 @@ class HealingOrchestrator:
                     max_risk = "Medium"
         return max_risk
 
+    
     def _heal(self, tagged_line: str, project_tag: str, err_hash: str):
-        autonomous = get_daemon_setting("autonomous_mode", "0") == "1"
-        start_time = time.time()
-        
-        # Token Minimization: Summarize log
-        summarized_line = summarize_log(tagged_line)
-        container_name = project_tag.strip("[]")
-        error_log_snippet = summarized_line
+        # Security Gate Kontrolü
+        is_safe, reason = self.run_safety_checks(project_tag, err_hash)
+        if not is_safe:
+            logger.error("[SECURITY] Security gate rejected fix: %s", reason)
+            return
 
-        # ── OTONOM HAFIZA ─────────────────────────────────────────────────────
-        _error_hash = compute_error_hash(container_name, error_log_snippet)
-        _cached_cmd = get_best_strategy(DB_PATH, _error_hash)
-
-        # Semantic fallback — fuzzy match if exact hash miss
-        _semantic_match = False
-        if not _cached_cmd:
-            sem = get_semantic_strategy(DB_PATH, error_log_snippet)
-            if sem:
-                _cached_cmd, _sim_score = sem
-                _semantic_match = True
-                logger.info("[SEMANTIC HIT] similarity=%.0f%% → %s", _sim_score * 100, _cached_cmd[:80])
-
-        if _cached_cmd:
-            _hit_type = "semantic-registry" if _semantic_match else "strategy-registry"
-            logger.info(f"[REGISTRY HIT] {container_name} hafızadan ({_hit_type}): {_cached_cmd}")
-            send_telegram_text(
-                TELEGRAM_CHAT_ID,
-                f"🧠 *Otonom Hafıza* — `{container_name}`\n"
-                f"Kayıtlı strateji (LLM Maliyeti: 0 token):\n`{_cached_cmd}`"
-            )
-            try:
-                _result = subprocess.run(
-                    _cached_cmd, shell=True, capture_output=True, text=True, timeout=60
-                )
-                _cache_success = _result.returncode == 0
-                _output = (_result.stdout + "\n" + _result.stderr).strip()
-            except Exception as _e:
-                logger.warning(f"[REGISTRY] Exception: {_e}")
-                _cache_success = False
-                _output = str(_e)
-
-            update_strategy_result(DB_PATH, _error_hash, _cached_cmd, _cache_success)
-
-            # Log and notify
-            save_heal_history(
-                error_hash=err_hash,
-                error_message=tagged_line,
-                project_tag=project_tag,
-                risk_level="Low",
-                prompt="Strategy Registry Cached Call",
-                llm_response=json.dumps([{"type": "shell", "payload": _cached_cmd}]),
-                llm_source="strategy-registry",
-                actions=[{"type": "shell", "payload": _cached_cmd}],
-                execution_output=[{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}],
-                success=_cache_success,
-                duration=time.time() - start_time
-            )
-            self._write_heal_log(tagged_line, _cached_cmd, _hit_type, _cache_success, project_tag, [{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
+        # Otonom Self-Correction Loop
+        prompt = f"Hata: {tagged_line}. Lütfen düzelt."
+        for attempt in range(3):
+            result = self.llm_query(prompt)
+            if not result: continue
             
-            report_incident_to_platform(
-                service=project_tag,
-                title=f"Autonomous Healing: {project_tag}",
-                logs=tagged_line,
-                status="resolved" if _cache_success else "failed",
-                proposed_command=_cached_cmd,
-                action_output=json.dumps([{"command": _cached_cmd, "status": "success" if _cache_success else "failed", "output": _output}])
-            )
-            append_incident_to_graph_doc(
-                service=project_tag,
-                title=f"Autonomous Healing: {project_tag}",
-                status="resolved" if _cache_success else "failed",
-                proposed_command=_cached_cmd,
-                success=_cache_success
-            )
-
-            if _cache_success:
-                logger.info("[REGISTRY] Cached strateji BAŞARILI, LLM atlandı.")
-                return
-            else:
-                logger.warning("[REGISTRY] Cached strateji başarısız → LLM fallback")
-                send_telegram_text(
-                    TELEGRAM_CHAT_ID,
-                    f"⚠️ `{container_name}` kayıtlı strateji başarısız, LLM devreye alındı."
-                )
-        # ── OTONOM HAFIZA SONU ────────────────────────────────────────────────
-
-        # ── DIAGNOSTIC LAYER 2 — Generic Path Resolution ────────────────────────
-        file_context = ""
-        detected_target_file: Optional[str] = None
-        skip_local_pi = False
-        try:
-            # Match any source file extension, not just .py
-            match = re.search(r'File "([^"]+\.[a-zA-Z]+)", line (\d+)', tagged_line)
-            if not match:
-                match = re.search(r'File "([^"]+\.py)", line (\d+)', tagged_line)
-            if match:
-                raw_file = match.group(1)
-                line_no = int(match.group(2))
-
-                # Attempt 1: docker inspect (generic, works for any customer)
-                container_name = project_tag.strip("[]").lower().replace(" ", "-").replace("_", "-")
-                # Try the container name directly and common variations
-                resolved = None
-                for cname in [container_name, container_name + "-api", container_name.split("-")[0]]:
-                    resolved = self.discovery.resolve_host_path(cname, raw_file)
-                    if resolved:
-                        detected_target_file = resolved
-                        logger.info("[DISCOVERY] Resolved via docker inspect: %s → %s", raw_file, detected_target_file)
-                        break
-
-                # Attempt 2: manifest service lookup
-                if not detected_target_file:
-                    svc = self.manifest.get_service_by_container(container_name)
-                    if svc and svc.get("compose_file"):
-                        project_dir = str(Path(svc["compose_file"]).parent)
-                        basename = os.path.basename(raw_file)
-                        candidate = os.path.join(project_dir, basename)
-                        if os.path.exists(candidate):
-                            detected_target_file = candidate
-                            logger.info("[DISCOVERY] Resolved via manifest: %s → %s", raw_file, detected_target_file)
-
-                # Attempt 3: fallback — if it's already an absolute host path
-                if not detected_target_file and raw_file.startswith("/") and os.path.exists(raw_file):
-                    detected_target_file = raw_file
-                    logger.info("[DISCOVERY] Path is already a valid host path: %s", raw_file)
-
-                if detected_target_file:
-                    logger.info("[DIAGNOSTIC] Traceback detected: %s L%d. Reading code context...", detected_target_file, line_no)
-                    start_line = max(1, line_no - 20)
-                    end_line = line_no + 20
-                    raw_code = self.file_editor.read_file(detected_target_file, start_line, end_line)
-                    if raw_code and not raw_code.startswith("Error"):
-                        file_context = (
-                            f"DETECTED ERROR FILE ({detected_target_file} lines {start_line}-{end_line}):\n"
-                            "```\n"
-                            f"{raw_code}\n"
-                            "```\n"
-                            "Analyze the code context above. Identify the error line and generate a 'replace' action.\n"
-                        )
-                        skip_local_pi = True   # large prompt — skip slow Pi Ollama
+            patch = self.extract_patch(result)
+            if self.file_editor.validate_syntax(patch):
+                self.file_editor.apply_patch(patch)
+                if self.run_canary_probe("http://localhost:8080"):
+                    logger.info("Otonom çözüm doğrulandı.")
+                    return True
                 else:
-                    logger.warning("[DIAGNOSTIC] Could not resolve host path for: %s", raw_file)
-        except Exception as e_diag:
-            logger.warning("[DIAGNOSTIC] Code context read failed: %s", e_diag)
-        # ── DIAGNOSTIC LAYER 2 END ───────────────────────────────────────────
+                    logger.warning("Çözüm uygulandı ama servis yanıt vermedi. Rollback yapılıyor.")
+                    self.rebuild_manager.rollback()
+            else:
+                logger.error("Üretilen kod hatalı. LLM tekrar yönlendiriliyor...")
+                prompt += "\nÖnceki çözüm syntax hatası verdi, lütfen düzelt."
+        return False
 
-        prompt = self._build_prompt(summarized_line, project_tag, err_hash, context_section=file_context)
-        
-        result = None
-        source = None
-        success = False
-
-        # 1. Local Mac Ollama (if online)
-        mac_online = self.mac_checker.is_mac_online()
-        if mac_online:
-            for attempt in range(1, MAX_LOCAL_TRIES + 1):
-                result = self.ollama.query(MAC_OLLAMA_URL, "qwen2.5-coder:32b", prompt)
-                source = "mac-ollama/qwen2.5-coder:32b"
-                if result:
-                    success = True
-                    break
-                time.sleep(5 * attempt)
-
-        # Budget helper
-        def run_with_budget(provider_name: str, query_fn) -> Optional[str]:
-            limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
-            current = get_daily_calls(provider_name)
-            if current >= limit:
-                logger.warning("Daily API budget exceeded for %s (%d/%d calls). Skipping.", provider_name, current, limit)
-                return None
-            res = query_fn()
-            if res is not None:
-                increment_daily_calls(provider_name)
-            return res
+    def run_with_budget(provider_name: str, query_fn) -> Optional[str]:
+        limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
+        current = get_daily_calls(provider_name)
+        if current >= limit:
+            logger.warning("Daily API budget exceeded for %s (%d/%d calls). Skipping.", provider_name, current, limit)
+            return None
+        res = query_fn()
+        if res is not None:
+            increment_daily_calls(provider_name)
+        return res
 
         # 2. Google Gemini API (Free tier)
         if not success and GEMINI_API_KEY:
             result = run_with_budget("gemini", lambda: self.gemini.query(prompt))
             source = "gemini/gemini-2.5-flash"
             success = result is not None
-
+            success = result is not None
         # 3. Groq API (Free tier)
         if not success and GROQ_API_KEY:
             result = run_with_budget("groq", lambda: self.groq.query(prompt))
@@ -2939,6 +2852,7 @@ def main():
 
     while not stop_event.is_set():
         stop_event.wait(timeout=60)
+        monitor_health()  # Health check
 
     logger.info("SRE Daemon durduruldu.")
 
@@ -2963,3 +2877,25 @@ def git_auto_sync():
         subprocess.run(["git", "push", "origin", "main"], check=True)
     except Exception as e:
         print(f"Git Sync Hatası: {e}")
+
+
+def monitor_health():
+    """Monitor health and alert via Telegram if critical."""
+    try:
+        history = get_heal_history_for_hash("global", limit=10)
+        failures = len([h for h in history if h.get("success") == False])
+        error_rate = failures / 10 if history else 0
+        if error_rate > 0.5:
+            status = "CRITICAL - HEALING INITIATED"
+            # Notify using the existing system variable TELEGRAM_CHAT_ID
+            try: send_telegram_text(TELEGRAM_CHAT_ID, "⚠️ ALERT: System Error Rate High: {:.2%}".format(error_rate))
+            except Exception: pass
+        else:
+            status = "NORMAL"
+        log_entry = f"HEALTH_CHECK: Failure Rate: {error_rate:.2%} | Status: {status}"
+        with open("health_check.log", "a") as f:
+            f.write(log_entry + chr(10))
+        if error_rate > 0.5: _heal()
+        return True
+    except Exception as e:
+        return False
