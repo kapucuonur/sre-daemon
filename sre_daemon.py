@@ -3057,6 +3057,20 @@ def telegram_poller():
                                 "• `/help` - Bu yardım mesajını gösterir."
                             )
                             send_telegram_text(chat_id, help_msg)
+                    else:
+                        # Hata çıktısı veya traceback gönderildiyse otonom analizi tetikle
+                        text_lower = text.lower()
+                        if any(k in text_lower for k in ["traceback", "error", "exception", "failed", "hata", "başarısız"]):
+                            send_telegram_text(chat_id, "🔍 *Telegram üzerinden gönderilen hata günlüğü analiz ediliyor ve onarım başlatılıyor...*")
+                            orchestrator = HealingOrchestrator()
+                            threading.Thread(
+                                target=orchestrator.handle_error,
+                                args=(text, "[Telegram-Manual]"),
+                                daemon=True
+                            ).start()
+                        else:
+                            send_telegram_text(chat_id, "❓ *Bilinmeyen Mesaj.*\nYardım almak için `/help` yazabilirsiniz veya analiz edilmesi için bir hata logunu/traceback çıktısını doğrudan gönderebilirsiniz.")
+
                 
                 # 2. Handle Inline Buttons (Callback Queries)
                 callback_query = update.get("callback_query")
