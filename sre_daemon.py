@@ -70,7 +70,7 @@ MANIFEST_PATH     = INSTALL_DIR / "manifest.yaml"
 SELF_PATH         = Path(__file__).resolve()
 HEAL_LOG          = os.getenv("HEAL_LOG", str(INSTALL_DIR / "heal_log.jsonl"))
 MAX_LOCAL_TRIES   = 3
-OLLAMA_TIMEOUT    = 180
+OLLAMA_TIMEOUT    = 60  # Reduced: if local model is slow, fall through to cloud
 ANTHROPIC_TIMEOUT = 60
 RATE_LIMIT_SECONDS = 600
 
@@ -1193,19 +1193,28 @@ class XAIClient:
                 "Content-Type": "application/json"
             }
             payload = {
-                "model": "grok-2-1212",
+                "model": "grok-3-mini",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.2
+                "temperature": 0.2,
+                "max_tokens": 2048
             }
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                logger.warning("xAI rate limited. Cooling down %ds.", retry_after)
+                time.sleep(min(retry_after, 60))
+                return None
+            if resp.status_code == 400:
+                logger.error("xAI 400 Bad Request: %s", resp.text[:200])
+                return None
             resp.raise_for_status()
             res_json = resp.json()
             text = res_json["choices"][0]["message"]["content"]
             return text.strip()
         except Exception as e:
-            logger.error("xAI/Grok API hatası: %s", str(e))
+            logger.error("xAI/Grok API error: %s", str(e))
         return None
 
 class AnthropicClient:
@@ -1307,8 +1316,6 @@ class HealingOrchestrator:
             f"\nCurrent service: {project_name}\n"
             "Services registered in manifest.yaml:\n"
             f"{services_ctx}\n\n"
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
             "The daemon resolves the real host path automatically from the traceback.\n"
             f"{past_context}\n"
             "Analyze the following error and respond with the minimal surgical fix:\n"
@@ -1319,8 +1326,6 @@ class HealingOrchestrator:
             "- 'append': Add a new line to a file (e.g., target='requirements.txt', payload='slowapi')\n"
             "- 'write': Overwrite a file with new content.\n"
             "- 'replace': Bir dosyada belirli bir kod bloğunu yeni kod bloğuyla değiştirmek için.\n"
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
             "- 'shell': Güvenli bir komut çalıştırmak için (örn: target='/home/pi/bikefit', payload='docker compose up -d --build bikefit-api').\n"
             "  NOT: Shell komutları yalnızca docker compose, docker restart veya systemctl restart/start komutları olmalıdır. Güvenli olmayan veya izin verilmeyen hiçbir komut çalıştırma!\n\n"
             f"{context_section}"
@@ -1493,8 +1498,6 @@ class HealingOrchestrator:
                             f"{raw_code}\n"
                             "```\n"
                             "Analyze the code context above. Identify the error line and generate a 'replace' action.\n"
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
                         )
                         skip_local_pi = True   # large prompt — skip slow Pi Ollama
                 else:
@@ -1580,26 +1583,16 @@ class HealingOrchestrator:
                 actions = data.get("actions", [])
 
                 # ── LAYER 3: Deterministic target override ────────────────────
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
                 if detected_target_file:
                     for act in actions:
                         if act.get("type") in ("replace", "write", "append"):
-                            t = act.get("target", "")
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
-                                act["target"] = detected_target_file
-                                logger.info("[LAYER3] target override → %s", detected_target_file)
+                            act["target"] = detected_target_file
+                            logger.info("[LAYER3] target override → %s", detected_target_file)
                 else:
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
                     filtered_actions = []
                     for act in actions:
                         t = act.get("target", "")
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
-            "  Format: {\"type\": \"replace\", \"target\": \"/absolute/file/path.py\", \"search\": \"old_code\", \"replace\": \"new_code\", \"line_hint\": 42}\n"
-            "  IMPORTANT: Set target to the real file path from the traceback. Set line_hint to the approximate line number of the search string to resolve ambiguous matches.\n"
+                        if not t:
                             continue
                         filtered_actions.append(act)
                     actions = filtered_actions
