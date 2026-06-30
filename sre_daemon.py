@@ -1344,17 +1344,20 @@ def check_circuit_breaker(tenant_id: str, service_name: str, db_path: Path = DB_
             if row and row[0]:
                 try:
                     frozen_until = datetime.fromisoformat(row[0])
+                    if frozen_until.tzinfo is None:
+                        frozen_until = frozen_until.replace(tzinfo=timezone.utc)
                     if frozen_until > now_dt:
-                        return False, f"frozen_until_{row[0]}"
+                        local_frozen = frozen_until.astimezone()
+                        return False, f"frozen_until_{local_frozen.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 except Exception:
                     pass
 
-            # Count failed repair attempts in the last 15 minutes
+            # Count failed repair attempts (only count repair_failed, skip rolled_back to avoid double counting)
             fifteen_min_ago = (now_dt - timedelta(minutes=15)).isoformat()
             fail_count = conn.execute(
                 """SELECT COUNT(*) FROM repair_attempts
                    WHERE tenant_id=? AND service_name=? AND attempted_at > ?
-                   AND outcome != 'success'""",
+                   AND outcome = 'repair_failed'""",
                 (tenant_id, service_name, fifteen_min_ago)
             ).fetchone()[0]
 
