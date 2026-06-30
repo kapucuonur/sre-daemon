@@ -1,13 +1,17 @@
 import os
 import sqlite3
 import pytest
+import subprocess
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 from sre_daemon import (
     count_ast_nodes,
     check_circuit_breaker,
     log_repair_attempt,
     run_canary_probe,
     HealingOrchestrator,
+    TenantRateLimiter,
+    tenant_rate_limiter,
     DB_PATH
 )
 
@@ -109,3 +113,91 @@ def test_canary_probing():
     ok, details = run_canary_probe(probe_fail_pattern)
     assert ok is False
     assert details == "response_body_pattern_mismatch"
+
+def test_tenant_rate_limiter():
+    limiter = TenantRateLimiter(calls_per_minute=2)
+    tenant_a = "tenant-a"
+    tenant_b = "tenant-b"
+    
+    # First call allowed
+    assert limiter.allow(tenant_a) is True
+    # Second call allowed
+    assert limiter.allow(tenant_a) is True
+    # Third call within same minute rate limited (returns False)
+    assert limiter.allow(tenant_a) is False
+    
+    # Tenant B should be independent (Blast Radius Isolation)
+    assert limiter.allow(tenant_b) is True
+
+def test_verify_patch_intent():
+    orchestrator = HealingOrchestrator()
+    original_patch = "def calculate_total(price, tax):\n    return price * (1 + tax)"
+    repaired_valid = "def calculate_total(price, tax):\n    # Fix tax value\n    return price * (1 + tax)"
+    repaired_invalid = "def calculate_total(price, tax):\n    return price"
+    
+    # Mock LLM cascade query response
+    with patch.object(orchestrator, "query_llm_cascade") as mock_query:
+        # Mock semantic consistency pass
+        mock_query.return_value = ("CONSISTENT\nThe fix preserves original logic.", "mock-cascade")
+        is_consistent, reason = orchestrator.verify_patch_intent(original_patch, repaired_valid, "some error", "tenant-1")
+        assert is_consistent is True
+        assert "mock-cascade" in reason
+        
+        # Mock semantic consistency fail (LLM detects code deletion/stubbing)
+        mock_query.return_value = ("INCONSISTENT\nReplaced functional code with stub/empty return.", "mock-cascade")
+        is_consistent, reason = orchestrator.verify_patch_intent(original_patch, repaired_invalid, "some error", "tenant-1")
+        assert is_consistent is False
+        assert "structural_drift" in reason or "INCONSISTENT" in reason
+
+@patch("sre_daemon.send_telegram_text")
+@patch("subprocess.run")
+def test_safe_rollback_success(mock_sub, mock_tg):
+    orchestrator = HealingOrchestrator()
+    repo_dir = Path("/tmp/mock_repo")
+    tag = "mock_tag"
+    
+    # Success case: git reset and tag delete commands run successfully
+    mock_sub.returncode = 0
+    
+    # Mock manifest loading for rebuild
+    orchestrator.manifest = MagicMock()
+    orchestrator.manifest.get_service_by_name.return_value = None
+    
+    ok = orchestrator.safe_rollback("tenant-1", "test-service", repo_dir, tag)
+    assert ok is True
+    mock_tg.assert_called_once()
+    assert "Rollback Yapıldı" in mock_tg.call_args[0][1]
+
+@patch("sre_daemon.send_telegram_text")
+@patch("subprocess.run")
+def test_safe_rollback_failure_last_resort(mock_sub, mock_tg):
+    orchestrator = HealingOrchestrator()
+    repo_dir = Path("/tmp/mock_repo")
+    tag = "mock_tag"
+    
+    # Git rollback fails (subprocess raises an exception)
+    mock_sub.side_effect = subprocess.SubprocessError("Git error")
+    
+    # Mock manifest config to simulate service teardown
+    orchestrator.manifest = MagicMock()
+    mock_svc = {
+        "name": "test-service",
+        "runtime": "systemd",
+        "unit": "test-service.service"
+    }
+    orchestrator.manifest.get_service_by_name.return_value = mock_svc
+    
+    # Since rollback failed, should trigger last resort stop and send critical P0 alarm
+    ok = orchestrator.safe_rollback("tenant-1", "test-service", repo_dir, tag)
+    assert ok is False
+    
+    # Assert that P0 telegram alert was sent
+    calls = [c[0][1] for c in mock_tg.call_args_list]
+    assert any("P0: ROLLBACK FAILED" in text for text in calls)
+    
+    # Assert that systemctl stop was called to teardown the service
+    stop_called = any(
+        "stop" in str(args) or "systemctl" in str(args)
+        for args, kwargs in mock_sub.call_args_list
+    )
+    assert stop_called is True
