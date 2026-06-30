@@ -541,18 +541,49 @@ def extract_feature_context(source_code, feature_title, feature_desc):
         for idx, line in enumerate(lines):
             # If function or class definition matches keyword
             if (line.startswith("class ") or "def " in line) and keyword in line.lower():
-                start = idx
-                indent = len(line) - len(line.lstrip())
-                end = min(len(lines), idx + 80)
-                # Find actual end based on indentation
-                for next_idx in range(idx + 1, min(len(lines), idx + 100)):
-                    next_line = lines[next_idx]
-                    if next_line.strip():
-                        next_indent = len(next_line) - len(next_line.lstrip())
-                        if next_indent <= indent and not next_line.strip().startswith("#"):
-                            end = next_idx
+                if line.startswith("class "):
+                    start = idx
+                    # Just the class header line (usually 1 line)
+                    end = idx + 1
+                    
+                    # Look for __init__ constructor inside this class
+                    init_start = -1
+                    for next_idx in range(idx + 1, min(len(lines), idx + 200)):
+                        next_line = lines[next_idx]
+                        if next_line.startswith("class "):
                             break
-                segment = "\n".join(lines[start:end])
+                        if "def __init__" in next_line:
+                            init_start = next_idx
+                            break
+                    
+                    if init_start != -1:
+                        # Extract the full body of __init__ method
+                        indent = len(lines[init_start]) - len(lines[init_start].lstrip())
+                        init_end = init_start + 1
+                        for next_idx in range(init_start + 1, min(len(lines), init_start + 100)):
+                            next_line = lines[next_idx]
+                            if next_line.strip():
+                                next_indent = len(next_line) - len(next_line.lstrip())
+                                if next_indent <= indent and not next_line.strip().startswith("#"):
+                                    init_end = next_idx
+                                    break
+                        segment = "\n".join(lines[start:end]) + "\n" + "\n".join(lines[init_start:init_end])
+                    else:
+                        segment = lines[start]
+                else:
+                    start = idx
+                    indent = len(line) - len(line.lstrip())
+                    end = min(len(lines), idx + 80)
+                    # Find actual end based on indentation
+                    for next_idx in range(idx + 1, min(len(lines), idx + 100)):
+                        next_line = lines[next_idx]
+                        if next_line.strip():
+                            next_indent = len(next_line) - len(next_line.lstrip())
+                            if next_indent <= indent and not next_line.strip().startswith("#"):
+                                end = next_idx
+                                break
+                    segment = "\n".join(lines[start:end])
+                
                 block_title = f"--- Definition matching '{keyword}' near line {start+1} ---"
                 # Avoid duplicate extractions of the exact same block
                 if not any(block_title in b for b in extracted_blocks):
