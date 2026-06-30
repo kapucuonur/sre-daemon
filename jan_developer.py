@@ -383,41 +383,45 @@ def extract_feature_context(source_code, feature_title, feature_desc):
     skeleton = []
     # 1. Build outline
     for idx, line in enumerate(lines):
-        if line.startswith("class ") or line.startswith("def ") or (line.startswith("    def ") and not line.strip().startswith("def __")):
-            skeleton.append(f"Line {idx+1}: {line}")
+        if line.startswith("class ") or line.startswith("def ") or line.startswith("    def "):
+            if not any(x in line for x in ["__init__", "self.", "return"]):
+                skeleton.append(f"Line {idx+1}: {line.strip()}")
 
     # 2. Derive keywords from title and desc
-    all_words = re.findall(r'\b[a-zA-Z]{4,}\b', f"{feature_title} {feature_desc}")
-    keywords = list(set([w.lower() for w in all_words]))
+    target_terms = []
+    for word in re.findall(r'\b[a-zA-Z]{5,}\b', f"{feature_title} {feature_desc}"):
+        w = word.lower()
+        if w in ["scaling", "predictive", "trend", "projected", "anomaly", "stats", "history"]:
+            target_terms.append(w)
     
-    # Common SRE terms that are highly useful
-    sre_terms = ["metric", "collector", "stats", "anomaly", "check", "alarm", "predict", "rebuild", "database"]
-    keywords.extend(sre_terms)
-    keywords = list(set(keywords))
+    target_terms = list(set(target_terms))
+    if not target_terms:
+        target_terms = ["metric", "stats"]
 
     extracted_blocks = []
     # 3. Extract blocks matching keywords
-    for keyword in keywords:
+    for keyword in target_terms:
         for idx, line in enumerate(lines):
             # If function or class definition matches keyword
             if (line.startswith("class ") or "def " in line) and keyword in line.lower():
                 start = idx
                 indent = len(line) - len(line.lstrip())
-                end = idx + 1
-                while end < len(lines):
-                    next_line = lines[end]
+                end = min(len(lines), idx + 80)
+                # Find actual end based on indentation
+                for next_idx in range(idx + 1, min(len(lines), idx + 100)):
+                    next_line = lines[next_idx]
                     if next_line.strip():
                         next_indent = len(next_line) - len(next_line.lstrip())
                         if next_indent <= indent and not next_line.strip().startswith("#"):
+                            end = next_idx
                             break
-                    end += 1
                 segment = "\n".join(lines[start:end])
                 block_title = f"--- Definition matching '{keyword}' near line {start+1} ---"
                 # Avoid duplicate extractions of the exact same block
                 if not any(block_title in b for b in extracted_blocks):
                     extracted_blocks.append(f"{block_title}\n{segment}\n")
 
-    return "--- CODE SKELETON ---\n" + "\n".join(skeleton[:100]) + "\n\n" + "\n".join(extracted_blocks[:15])
+    return "--- CODE SKELETON ---\n" + "\n".join(skeleton[:50]) + "\n\n" + "\n".join(extracted_blocks[:3])
 
 FEATURES_JSON = INSTALL_DIR / "features.json"
 
