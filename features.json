@@ -1,0 +1,11 @@
+{
+  "features": [
+    {
+      "id": "predictive_scaling_advisor",
+      "title": "Predictive Scaling Advisor",
+      "description": "Read CPU and Memory metrics trends from the state DB and calculate a trend-line. If CPU usage is projected to hit 90% or memory exceeds 85% in the next 10 minutes, trigger a predictive warning and notify Telegram.",
+      "status": "pending",
+      "created_at": "2026-06-30T21:45:00Z"
+    }
+  ]
+}

@@ -374,13 +374,242 @@ Output your response strictly as a JSON object of this format (do not include ma
             pass
         return False
 
+FEATURES_JSON = INSTALL_DIR / "features.json"
+
+def check_features_pipeline():
+    """Checks features.json for pending feature requests and implements them autonomously."""
+    if not FEATURES_JSON.exists():
+        return False
+
+    try:
+        with open(FEATURES_JSON, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        log_error(f"Failed to read features.json: {e}")
+        return False
+
+    features = data.get("features", [])
+    pending_feature = None
+    pending_idx = -1
+    for idx, feat in enumerate(features):
+        if feat.get("status") == "pending":
+            pending_feature = feat
+            pending_idx = idx
+            break
+
+    if not pending_feature:
+        return False
+
+    feat_id = pending_feature.get("id")
+    title = pending_feature.get("title")
+    desc = pending_feature.get("description")
+
+    log_info(f"Found pending feature request: {title} ({feat_id})")
+
+    # Mark as in_progress
+    features[pending_idx]["status"] = "in_progress"
+    try:
+        with open(FEATURES_JSON, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log_error(f"Failed to update features.json: {e}")
+        return False
+
+    send_telegram_text(
+        f"🤖 *Jan: Yeni Özellik Geliştirme Başladı*\n\n"
+        f"📍 *Özellik*: `{title}`\n"
+        f"📝 *Açıklama*: {desc}\n"
+        f"⚡ Jan kod tabanını analiz ediyor..."
+    )
+
+    # Load current sre_daemon.py source code to provide general context
+    sre_daemon_path = INSTALL_DIR / "sre_daemon.py"
+    if not sre_daemon_path.exists():
+        log_error("sre_daemon.py not found, aborting.")
+        return False
+
+    with open(sre_daemon_path, "r", encoding="utf-8") as f:
+        source_code = f.read()
+
+    # Formulate prompt for new features
+    prompt = f"""You are Jan, the self-evolving AI SRE developer agent.
+Your primary task is to implement a new feature in 'sre_daemon.py' and its corresponding tests based on the feature request below.
+
+[FEATURE REQUEST]
+ID: {feat_id}
+Title: {title}
+Description: {desc}
+
+You must write clean, correct, and robust code for the feature.
+You must also include tests to verify the new feature.
+Generate a JSON output listing the patches to apply to the files. Each patch block targets a file, specifies a 'search' block to replace, and a 'replace' block.
+If you need to create a completely new file (like a new test file under 'tests/'), set 'search' to an empty string ("") or omit it, and set the target path and 'replace' content.
+
+Output your response strictly as a JSON object of this format (do not include markdown wrapper blocks or explanations):
+{{
+  "patches": [
+    {{
+      "target": "sre_daemon.py",
+      "search": "exact code lines to replace",
+      "replace": "new corrected code lines"
+    }},
+    {{
+      "target": "tests/test_predictive.py",
+      "search": "",
+      "replace": "complete content of the new test file"
+    }}
+  ]
+}}
+"""
+
+    response_text, provider = query_llm_cascade(prompt)
+    if not response_text:
+        log_error("Could not obtain a response from any LLM in the cascade.")
+        features[pending_idx]["status"] = "failed"
+        with open(FEATURES_JSON, "w") as f:
+            json.dump(data, f, indent=2)
+        return False
+
+    log_info(f"LLM cascade response received from {provider}.")
+
+    cleaned = response_text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+
+    try:
+        patch_data = json.loads(cleaned)
+        patches = patch_data.get("patches", [])
+        if not patches:
+            log_error("No patches found in LLM response.")
+            features[pending_idx]["status"] = "failed"
+            with open(FEATURES_JSON, "w") as f:
+                json.dump(data, f, indent=2)
+            return False
+
+        # Apply patches atomically
+        applied_count = 0
+        for p in patches:
+            target_rel = p.get("target")
+            if not target_rel:
+                continue
+            target_path = INSTALL_DIR / target_rel
+            search_str = p.get("search", "")
+            replace_str = p.get("replace", "")
+
+            # If file doesn't exist, create it (new file support)
+            if not target_path.exists():
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(replace_str, encoding="utf-8")
+                applied_count += 1
+                log_info(f"Created new file: {target_rel}")
+                continue
+
+            current_content = target_path.read_text(encoding="utf-8")
+            count = current_content.count(search_str)
+            if count == 0:
+                log_error(f"Search block not found in file {target_rel}:\n{search_str[:150]}")
+                continue
+            if count > 1:
+                log_error(f"Search block matches multiple locations ({count}) in {target_rel}, patch is ambiguous.")
+                continue
+
+            new_content = current_content.replace(search_str, replace_str, 1)
+            target_path.write_text(new_content, encoding="utf-8")
+            applied_count += 1
+            log_info(f"Applied patch to {target_rel}.")
+
+        if applied_count == 0:
+            log_error("No patches could be applied successfully.")
+            features[pending_idx]["status"] = "failed"
+            with open(FEATURES_JSON, "w") as f:
+                json.dump(data, f, indent=2)
+            return False
+
+        # Verification Gate
+        log_info("Running pytest suite for validation...")
+        pytest_cmd = [str(INSTALL_DIR / "venv/bin/pytest"), "-v"]
+        if not (INSTALL_DIR / "venv").exists():
+            pytest_cmd = ["pytest", "-v"] # fallback
+            
+        test_res = subprocess.run(pytest_cmd, cwd=str(INSTALL_DIR), capture_output=True, text=True, timeout=60)
+        if test_res.returncode == 0:
+            log_info("Verification gate PASSED! All unit tests pass.")
+            
+            # Commit and push changes
+            try:
+                subprocess.run(["git", "-C", str(INSTALL_DIR), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(INSTALL_DIR), "commit", "-m", f"jan: otonom ozellik gelistirme - {title}"], check=True)
+                push_res = subprocess.run(["git", "-C", str(INSTALL_DIR), "push", "origin", "main"], capture_output=True, text=True, timeout=30)
+                if push_res.returncode == 0:
+                    log_info("Successfully pushed changes to GitHub.")
+                else:
+                    log_error(f"Git push failed: {push_res.stderr}")
+            except Exception as git_ex:
+                log_error(f"Git operations failed: {git_ex}")
+
+            # Restart SRE Daemon service
+            log_info("Restarting SRE Daemon service...")
+            restart_res = subprocess.run(["sudo", "/usr/bin/systemctl", "restart", "sre-daemon"], capture_output=True, text=True, timeout=10)
+            if restart_res.returncode == 0:
+                log_info("SRE Daemon service restarted successfully.")
+            else:
+                log_error(f"Failed to restart SRE Daemon: {restart_res.stderr}")
+
+            # Update features.json status to implemented
+            features[pending_idx]["status"] = "implemented"
+            with open(FEATURES_JSON, "w") as f:
+                json.dump(data, f, indent=2)
+
+            # Notify via Telegram
+            send_telegram_text(
+                f"🤖 *Jan: Yeni Özellik Başarıyla Devreye Alındı!* ✅\n\n"
+                f"📍 *Özellik*: `{title}`\n"
+                f"⏱ *Doğrulama*: `pytest` başarıyla tamamlandı\n"
+                f"📦 *Push*: GitHub'a gönderildi\n"
+                f"🔄 *Servis*: Yeniden başlatıldı."
+            )
+            return True
+        else:
+            log_error(f"Verification gate FAILED! Pytest output:\n{test_res.stdout}\n{test_res.stderr}")
+            # Rollback
+            subprocess.run(["git", "-C", str(INSTALL_DIR), "checkout", "--", "."], check=True)
+            log_info("Git checkout executed. Rollback successful.")
+            
+            # Remove any untracked files
+            subprocess.run(["git", "-C", str(INSTALL_DIR), "clean", "-fd"], check=True)
+
+            features[pending_idx]["status"] = "failed"
+            with open(FEATURES_JSON, "w") as f:
+                json.dump(data, f, indent=2)
+
+            send_telegram_text(
+                f"❌ *Jan: Özellik Geliştirme Başarısız*\n\n"
+                f"Özellik: `{title}`\n"
+                "Üretilen kod veya testler mevcut sistemi bozdu, değişiklikler geri alındı.\n"
+                f"Hata: `{md_escape(test_res.stderr[:200] or test_res.stdout[:200])}`"
+            )
+            return False
+
+    except Exception as ex:
+        log_error(f"An error occurred during feature implementation: {ex}")
+        # Rollback as last resort
+        try:
+            subprocess.run(["git", "-C", str(INSTALL_DIR), "checkout", "--", "."], check=True)
+            subprocess.run(["git", "-C", str(INSTALL_DIR), "clean", "-fd"], check=True)
+        except Exception:
+            pass
+        return False
+
 def md_escape(text: str) -> str:
     for char in ["_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
         text = text.replace(char, f"\\{char}")
     return text
 
 def main():
-    log_info("Jan Developer Agent started checking logs and db...")
+    log_info("Jan Developer Agent started checking logs, db, and features...")
     
     # Check 1: Failed healing in DB
     failed_history = check_failed_heal_history()
@@ -393,13 +622,16 @@ def main():
     # Check 2: Tracebacks in log files
     tracebacks = check_for_tracebacks()
     if tracebacks:
-        # Check if the traceback is fresh
         tb = tracebacks[-1]
         log_info(f"Traceback detected in {tb['source']}.")
         analyze_and_patch(tb["content"])
         return
 
-    log_info("No fresh tracebacks or failed actions detected. Going to sleep.")
+    # Check 3: Feature request pipeline
+    if check_features_pipeline():
+        return
+
+    log_info("No fresh tracebacks, failed actions, or pending features detected. Going to sleep.")
 
 if __name__ == "__main__":
     main()
