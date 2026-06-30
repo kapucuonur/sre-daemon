@@ -134,31 +134,19 @@ def query_llm_cascade(prompt):
     return None, None
 
 def check_for_tracebacks():
-    """Scans daemon.log and journalctl for unhandled Python tracebacks."""
+    """Scans journalctl for unhandled Python tracebacks in the last 5 minutes."""
     errors = []
-    # 1. Read daemon.log
-    if DAEMON_LOG.exists():
-        try:
-            with open(DAEMON_LOG, "r", errors="ignore") as f:
-                content = f.read()
-            # Find python tracebacks
-            matches = re.findall(r"(Traceback \(most recent call last\):.*?\n[a-zA-Z0-9_]+Error:.*)", content, re.DOTALL)
-            if matches:
-                # Get the last traceback
-                errors.append({"source": "daemon.log", "content": matches[-1]})
-        except Exception as e:
-            log_error(f"Failed to parse daemon.log: {e}")
-
-    # 2. Read journalctl
     try:
         res = subprocess.run(
-            ["journalctl", "-u", "sre-daemon", "-p", "err", "-n", "10", "--no-pager"],
+            ["journalctl", "-u", "sre-daemon", "-p", "err", "--since", "5 minutes ago", "--no-pager"],
             capture_output=True, text=True, timeout=10
         )
         if res.returncode == 0 and res.stdout.strip():
-            errors.append({"source": "journalctl", "content": res.stdout.strip()})
-    except Exception:
-        pass
+            content = res.stdout.strip()
+            if "Traceback (most recent call last)" in content:
+                errors.append({"source": "journalctl", "content": content})
+    except Exception as e:
+        log_error(f"Failed to scan journalctl: {e}")
 
     return errors
 
@@ -171,22 +159,30 @@ def check_failed_heal_history():
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("""
-                SELECT error_message, project_tag, prompt, actions, execution_output, created_at 
+                SELECT error_message, project_tag, llm_prompt_used, actions_json, execution_output, created_at 
                 FROM heal_history 
                 WHERE success = 0 
                 ORDER BY id DESC LIMIT 1
             """)
             row = cur.fetchone()
             if row:
+                data = {
+                    "error_message": row["error_message"],
+                    "project_tag": row["project_tag"],
+                    "prompt": row["llm_prompt_used"],
+                    "actions": row["actions_json"],
+                    "execution_output": row["execution_output"],
+                    "created_at": row["created_at"]
+                }
                 # Parse timestamp
-                created_str = row["created_at"]
+                created_str = data["created_at"]
                 if "+" in created_str:
                     created_str = created_str.split("+")[0]
                 created_dt = datetime.fromisoformat(created_str).replace(tzinfo=timezone.utc)
                 age = (datetime.now(timezone.utc) - created_dt).total_seconds()
                 # If the failed action is fresh (last 5 minutes)
                 if age < 300:
-                    return dict(row)
+                    return data
     except Exception as e:
         log_error(f"Failed to query heal_history DB: {e}")
     return None
