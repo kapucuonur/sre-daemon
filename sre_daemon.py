@@ -2209,7 +2209,7 @@ class HealingOrchestrator:
 
     def execute_approved_actions(self, actions: List[Dict[str, Any]], action_id: int) -> List[Dict[str, Any]]:
         executed = []
-        tenant_id = self.manifest.tenant_id() or "unknown_tenant"
+        tenant_id = self.manifest.tenant_id or "unknown_tenant"
         
         # Determine the service name from targeted actions
         service_name = "unknown_service"
