@@ -3231,6 +3231,31 @@ class MetricsCollector(threading.Thread):
         return num / den if den != 0 else 0.0
 
     def predict_scaling_advisor(self):
+        cpu_metrics = self.get_cpu_metrics()
+        mem_metrics = self.get_mem_metrics()
+        cpu_trend = self.calculate_trend_line(cpu_metrics)
+        mem_trend = self.calculate_trend_line(mem_metrics)
+        if cpu_trend > 0 and cpu_metrics[-1] > 80:
+            self.trigger_predictive_warning(cpu_metrics[-1], mem_metrics[-1])
+        if mem_trend > 0 and mem_metrics[-1] > 80:
+            self.trigger_predictive_warning(cpu_metrics[-1], mem_metrics[-1])
+
+    def get_cpu_metrics(self) -> list:
+        # implement logic to get cpu metrics from state db
+        pass
+
+    def get_mem_metrics(self) -> list:
+        # implement logic to get memory metrics from state db
+        pass
+
+    def trigger_predictive_warning(self, cpu: float, mem: float):
+        msg = (
+            f"⚠️ *PREDOMPTIVE SCALING WARNING:* CPU usage is at {cpu:.1f}% and memory usage is at {mem:.1f}%. "
+            f"Projected to hit 90% CPU or 85% memory in the next 10 minutes."
+        )
+        send_telegram_text(TELEGRAM_CHAT_ID, msg)
+
+    def predict_scaling_advisor(self):
         # Otonom Predictive Scaling eklendi
         return True
 
