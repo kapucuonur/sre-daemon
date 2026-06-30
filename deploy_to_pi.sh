@@ -22,6 +22,8 @@ sshpass -p "pi" ssh -o StrictHostKeyChecking=no "$PI_HOST" "mkdir -p $PI_SRE_DIR
 # 2. Python daemon dosyasını kopyala
 echo "→ [2/5] sre_daemon.py aktarılıyor..."
 sshpass -p "pi" scp -o StrictHostKeyChecking=no "$LOCAL_FILES/sre_daemon.py" "$PI_HOST:$PI_SRE_DIR/sre_daemon.py"
+echo "→ Tests klasörü aktarılıyor..."
+sshpass -p "pi" scp -o StrictHostKeyChecking=no "$LOCAL_FILES/tests/test_safety.py" "$PI_HOST:$PI_SRE_DIR/tests/test_safety.py"
 
 # 3. requirements.txt kopyala ve kur
 echo "→ [3/5] Python bağımlılıkları kuruluyor..."

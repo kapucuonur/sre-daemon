@@ -311,6 +311,28 @@ def init_db():
                     PRIMARY KEY (error_hash, command)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS repair_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    service_name TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK(outcome IN ('success','repair_failed','canary_failed','rolled_back')),
+                    error_summary TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+                    tenant_id TEXT NOT NULL,
+                    service_name TEXT NOT NULL,
+                    frozen_until TEXT,
+                    PRIMARY KEY (tenant_id, service_name)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_attempts_lookup
+                ON repair_attempts (tenant_id, service_name, attempted_at)
+            """)
             # Default settings
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES ('autonomous_mode', '0')"
@@ -951,7 +973,27 @@ class LanguageValidator:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if res.returncode != 0:
                 err = (res.stderr or res.stdout)[:500]
-                return False, err
+                return False, f"Compile Error: {err}"
+            
+            # For python files, run pyflakes as well if it passes py_compile
+            if ext == ".py":
+                try:
+                    pyflakes_res = subprocess.run(["python3", "-m", "pyflakes", file_path], capture_output=True, text=True, timeout=15)
+                    if pyflakes_res.returncode != 0:
+                        output = pyflakes_res.stdout + "\n" + pyflakes_res.stderr
+                        real_errors = []
+                        for line in output.splitlines():
+                            if not line.strip():
+                                continue
+                            line_lower = line.lower()
+                            if "unused" in line_lower:
+                                continue
+                            real_errors.append(line)
+                        if real_errors:
+                            return False, "Semantic Error (pyflakes):\n" + "\n".join(real_errors)[:500]
+                except Exception as pyf_ex:
+                    logger.warning("[VALIDATOR] pyflakes execution failed: %s", pyf_ex)
+            
             return True, ""
         except Exception as e:
             return False, str(e)
@@ -1055,7 +1097,7 @@ class FileEditor:
 
     def validate_syntax(self, file_path: str) -> tuple:
         """
-        Validates python file syntax using py_compile.
+        Validates python file syntax using py_compile and pyflakes.
         Returns: (is_valid: bool, error_message: str)
         """
         if not file_path.endswith(".py"):
@@ -1063,11 +1105,29 @@ class FileEditor:
         try:
             import py_compile
             py_compile.compile(file_path, doraise=True)
-            return True, ""
         except py_compile.PyCompileError as e:
-            return False, str(e)
+            return False, f"Compile Error: {e}"
         except Exception as e:
-            return False, str(e)
+            return False, f"Compile Exception: {e}"
+
+        # Run pyflakes semantic check
+        try:
+            res = subprocess.run(["python3", "-m", "pyflakes", file_path], capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                output = res.stdout + "\n" + res.stderr
+                real_errors = []
+                for line in output.splitlines():
+                    if not line.strip():
+                        continue
+                    line_lower = line.lower()
+                    if "unused" in line_lower:
+                        continue
+                    real_errors.append(line)
+                if real_errors:
+                    return False, "Semantic Error (pyflakes):\n" + "\n".join(real_errors)[:500]
+        except Exception as e:
+            logger.warning("[VALIDATOR] pyflakes execution failed in FileEditor: %s", e)
+        return True, ""
 
     def apply_patch(self, file_path: str, search_block: str, replace_block: str, dry_run: bool = False) -> tuple:
         """
@@ -1278,6 +1338,125 @@ class AnthropicClient:
             logger.error("Anthropic API hatası: %s", str(e))
         return None
 
+# ── Tenant Rate Limiter (Blast Radius Isolation) ──
+class TenantRateLimiter:
+    def __init__(self, calls_per_minute: int = 5):
+        self.calls_per_minute = calls_per_minute
+        self.buckets = {}
+        self.lock = threading.Lock()
+
+    def allow(self, tenant_id: str) -> bool:
+        with self.lock:
+            now = time.time()
+            if tenant_id not in self.buckets:
+                self.buckets[tenant_id] = [now]
+                return True
+            history = [t for t in self.buckets[tenant_id] if now - t < 60]
+            if len(history) >= self.calls_per_minute:
+                return False
+            history.append(now)
+            self.buckets[tenant_id] = history
+            return True
+
+tenant_rate_limiter = TenantRateLimiter(calls_per_minute=5)
+
+# ── AST Node Counter (Intent Verification Helper) ──
+def count_ast_nodes(code: str) -> int:
+    import ast
+    try:
+        tree = ast.parse(code)
+        count = 0
+        for node in ast.walk(tree):
+            count += 1
+        return count
+    except Exception:
+        return 0
+
+# ── SQLite Circuit Breaker & Logging ──
+def check_circuit_breaker(tenant_id: str, service_name: str, db_path: Path = DB_PATH) -> tuple[bool, str | None]:
+    """Returns (is_allowed, freeze_reason). Restart-proof, tenant-isolated."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            now_dt = datetime.now(timezone.utc)
+            now_str = now_dt.isoformat()
+            
+            # Is service already frozen?
+            row = conn.execute(
+                "SELECT frozen_until FROM circuit_breaker_state WHERE tenant_id=? AND service_name=?",
+                (tenant_id, service_name)
+            ).fetchone()
+            if row and row[0]:
+                try:
+                    frozen_until = datetime.fromisoformat(row[0])
+                    if frozen_until.tzinfo is None:
+                        frozen_until = frozen_until.replace(tzinfo=timezone.utc)
+                    if frozen_until > now_dt:
+                        local_frozen = frozen_until.astimezone()
+                        return False, f"frozen_until_{local_frozen.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                except Exception:
+                    pass
+
+            # Count failed repair attempts (only count repair_failed, skip rolled_back to avoid double counting)
+            fifteen_min_ago = (now_dt - timedelta(minutes=15)).isoformat()
+            fail_count = conn.execute(
+                """SELECT COUNT(*) FROM repair_attempts
+                   WHERE tenant_id=? AND service_name=? AND attempted_at > ?
+                   AND outcome != 'success'""",
+                (tenant_id, service_name, fifteen_min_ago)
+            ).fetchone()[0]
+
+            if fail_count >= 3:
+                freeze_until = (now_dt + timedelta(hours=1)).isoformat()
+                conn.execute(
+                    """INSERT INTO circuit_breaker_state (tenant_id, service_name, frozen_until)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(tenant_id, service_name) DO UPDATE SET frozen_until=excluded.frozen_until""",
+                    (tenant_id, service_name, freeze_until)
+                )
+                conn.commit()
+                return False, "limit_exceeded_freezing"
+    except Exception as e:
+        logger.error("[CB] Circuit breaker database check failed: %s", e)
+    return True, None
+
+def log_repair_attempt(tenant_id: str, service_name: str, outcome: str, error_summary: str = None, db_path: Path = DB_PATH):
+    try:
+        with sqlite3.connect(db_path) as conn:
+            now_str = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """INSERT INTO repair_attempts (tenant_id, service_name, attempted_at, outcome, error_summary)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (tenant_id, service_name, now_str, outcome, error_summary)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error("[CB] Failed to log repair attempt: %s", e)
+
+# ── Canary Probing ──
+def run_canary_probe(probe_config: dict) -> tuple[bool, str]:
+    if not probe_config or "command" not in probe_config:
+        return True, "no_probe_configured"
+    try:
+        # Run command with timeout
+        result = subprocess.run(
+            probe_config["command"], shell=True, capture_output=True,
+            text=True, timeout=probe_config.get("timeout_seconds", 10)
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()[:200]
+            return False, f"exit_code_{result.returncode} ({err})"
+
+        pattern = probe_config.get("expected_pattern")
+        if pattern:
+            if not re.search(pattern, result.stdout):
+                return False, "response_body_pattern_mismatch"
+
+        return True, "ok"
+    except subprocess.TimeoutExpired:
+        return False, "probe_timeout"
+    except Exception as e:
+        return False, f"probe_failed_exception: {e}"
+
 # ── Healing Orchestrator & Action Runner ─────────────────────
 class HealingOrchestrator:
     def run_safety_checks(self, project_tag, error_hash):
@@ -1297,6 +1476,160 @@ class HealingOrchestrator:
         self.discovery        = ServiceDiscovery()
         self.lang_validator   = LanguageValidator()
         self.rebuild_manager  = RebuildManager()
+
+    def query_llm_cascade(self, prompt: str, tenant_id: str, skip_local_pi: bool = False) -> tuple[Optional[str], Optional[str]]:
+        """
+        Queries the LLM cascade and returns (result, source).
+        """
+        # Tenant rate limiting check (Blast Radius Isolation)
+        if not tenant_rate_limiter.allow(tenant_id):
+            logger.warning("[RATE LIMIT] Tenant %s cascade rate limit hit", tenant_id)
+            return None, None
+
+        result = None
+        source = None
+        success = False
+
+        # 1. Local Mac Ollama (if online)
+        mac_online = self.mac_checker.is_mac_online()
+        if mac_online:
+            for attempt in range(1, MAX_LOCAL_TRIES + 1):
+                result = self.ollama.query(MAC_OLLAMA_URL, "qwen2.5-coder:32b", prompt)
+                source = "mac-ollama/qwen2.5-coder:32b"
+                if result:
+                    success = True
+                    break
+                time.sleep(5 * attempt)
+
+        # Budget helper
+        def run_with_budget(provider_name: str, query_fn) -> Optional[str]:
+            limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
+            current = get_daily_calls(provider_name)
+            if current >= limit:
+                logger.warning("Daily API budget exceeded for %s (%d/%d calls). Skipping.", provider_name, current, limit)
+                return None
+            res = query_fn()
+            if res is not None:
+                increment_daily_calls(provider_name)
+            return res
+
+        # 2. Google Gemini API (Free tier)
+        if not success and GEMINI_API_KEY:
+            result = run_with_budget("gemini", lambda: self.gemini.query(prompt))
+            source = "gemini/gemini-2.5-flash"
+            success = result is not None
+
+        # 3. Groq API (Free tier)
+        if not success and GROQ_API_KEY:
+            result = run_with_budget("groq", lambda: self.groq.query(prompt))
+            source = "groq/llama-3.3-70b-versatile"
+            success = result is not None
+
+        # 4. Grok (xAI) API (Cheap cloud fallback)
+        if not success and XAI_API_KEY:
+            result = run_with_budget("xai", lambda: self.xai.query(prompt))
+            source = "xai/grok-2-1212"
+            success = result is not None
+
+        # 5. Local Pi Ollama (Offline fallback)
+        if not success and not skip_local_pi:
+            for attempt in range(1, MAX_LOCAL_TRIES + 1):
+                result = self.ollama.query(PI_OLLAMA_URL, "qwen2.5-coder:7b", prompt)
+                source = "pi-ollama/qwen2.5-coder:7b"
+                if result:
+                    success = True
+                    break
+                time.sleep(5 * attempt)
+        elif not success and skip_local_pi:
+            logger.info("[HEAL] Pi Ollama skipped (code context prompt — using cloud cascade)")
+
+        # 6. Anthropic Claude (Expensive cloud fallback)
+        if not success and ANTHROPIC_KEY:
+            result = run_with_budget("claude", lambda: self.anthropic.query(prompt))
+            source = "anthropic/claude-sonnet-4-6"
+            success = result is not None
+
+        if success and result:
+            return result, source
+        return None, None
+
+    def verify_patch_intent(self, original_patch: str, repaired_code: str, error_context: str, tenant_id: str) -> tuple[bool, str]:
+        """
+        Verifies that the repaired patch preserves the original patch's semantic goal.
+        Uses AST node count thresholding + LLM intent verification.
+        """
+        # 1. Structural drift check
+        orig_nodes = count_ast_nodes(original_patch)
+        new_nodes = count_ast_nodes(repaired_code)
+        if orig_nodes > 0:
+            diff_ratio = abs(orig_nodes - new_nodes) / max(orig_nodes, 1)
+            if diff_ratio > 0.4:
+                return False, f"structural_drift_exceeds_threshold ({diff_ratio:.2%})"
+
+        # 2. LLM validation prompt
+        prompt = (
+            "You are an AI validation assistant. You must verify if a corrected patch (repaired version) "
+            "retains the identical semantic goal and features as the original proposed patch, or if it "
+            "destructively deletes functionality/logic to bypass errors.\n\n"
+            f"Original proposed patch:\n{original_patch}\n\n"
+            f"Repaired version:\n{repaired_code}\n\n"
+            f"Error that triggered the repair:\n{error_context}\n\n"
+            "Respond with ONLY 'CONSISTENT' or 'INCONSISTENT' on the first line, followed by a one-line reason. "
+            "Mark as INCONSISTENT if the repaired version deletes functionality, bypasses checks by returning dummy stubs, "
+            "comments out code rather than fixing it, or drifts from the original patch's logic."
+        )
+        
+        res, source = self.query_llm_cascade(prompt, tenant_id, skip_local_pi=True)
+        if not res:
+            return False, "Failed to query LLM for validation verification"
+        
+        is_consistent = res.strip().upper().startswith("CONSISTENT")
+        return is_consistent, f"Verification model ({source}): {res.strip()}"
+
+    def safe_rollback(self, tenant_id: str, service_name: str, repo_dir: Path, target_tag: str) -> bool:
+        """Rollback, tenant-scoped. If it fails, stops the service and sends P0 alarm."""
+        try:
+            # 1. Reset repo to tag
+            subprocess.run(["git", "-C", str(repo_dir), "reset", "--hard", target_tag], check=True, timeout=30)
+            subprocess.run(["git", "-C", str(repo_dir), "tag", "-d", target_tag], check=True, timeout=10)
+            
+            # 2. Rebuild/Restart the service to restore health
+            svc_cfg = self.manifest.get_service_by_name(service_name)
+            if svc_cfg:
+                self.rebuild_manager.rebuild(svc_cfg)
+                
+            send_telegram_text(
+                TELEGRAM_CHAT_ID,
+                f"⚠️ *Rollback Yapıldı*\n"
+                f"📍 *Tenant/Servis*: `{tenant_id}/{service_name}`\n"
+                f"Etikete geri dönüldü: `{target_tag}`"
+            )
+            return True
+        except Exception as e:
+            # Rollback failed — son çare (last resort): stop service, send P0 page
+            logger.error("[CRITICAL] Rollback failed for %s to tag %s: %s. Stopping service...", repo_dir, target_tag, e)
+            try:
+                svc_cfg = self.manifest.get_service_by_name(service_name)
+                if svc_cfg:
+                    runtime = svc_cfg.get("runtime", "")
+                    if runtime == "docker-compose":
+                        cf = svc_cfg.get("compose_file", "")
+                        if cf:
+                            subprocess.run(["docker", "compose", "-f", cf, "down"], capture_output=True, timeout=30)
+                    elif runtime == "systemd":
+                        unit = svc_cfg.get("unit", "")
+                        if unit:
+                            subprocess.run(["sudo", "systemctl", "stop", unit], capture_output=True, timeout=30)
+            except Exception as stop_ex:
+                logger.error("[CRITICAL] Failed to stop service %s: %s", service_name, stop_ex)
+                
+            send_telegram_text(
+                TELEGRAM_CHAT_ID,
+                f"🚨 *P0: ROLLBACK FAILED* — `{tenant_id}/{service_name}`\n"
+                f"Service STOPPED as last resort. Manual intervention required!\n"
+                f"Hata: `{md_escape(str(e))}`"
+            )
+            return False
 
     def handle_error(self, tagged_line: str, project_tag: str, err_hash: str = None):
         if not err_hash:
@@ -1590,7 +1923,7 @@ class HealingOrchestrator:
                                             f"🔄 *SRE Failure Analysis — Alternatif Fix Başarılı*\n"
                                             f"📍 *Servis*: `{md_escape(project_tag)}`\n"
                                             f"🤖 *Kaynak*: `{md_escape(retry_source)}`\n"
-                                            f"Sistem alternatif stratejiyle stabilize edildi\."
+                                            f"Sistem alternatif stratejiyle stabilize edildi."
                                         )
                                     else:
                                         logger.warning("[FAILURE-ANALYSIS] Alternative fix also failed. Giving up.")
@@ -1790,24 +2123,63 @@ class HealingOrchestrator:
 
     def execute_approved_actions(self, actions: List[Dict[str, Any]], action_id: int) -> List[Dict[str, Any]]:
         executed = []
+        tenant_id = self.manifest.tenant_id or "unknown_tenant"
+        
+        # Determine the service name from targeted actions
+        service_name = "unknown_service"
+        for act in actions:
+            container_hint = act.get("_container_hint", "")
+            if container_hint:
+                service_name = container_hint
+                break
+            target = act.get("target", "")
+            if target:
+                for svc in self.manifest.services:
+                    cf = svc.get("compose_file", "")
+                    if cf and target.startswith(str(Path(cf).parent)):
+                        service_name = svc.get("name", "unknown_service")
+                        break
+                if service_name != "unknown_service":
+                    break
+
+        # ── 1. Circuit Breaker Pre-Check (Layer D) ──
+        is_allowed, freeze_reason = check_circuit_breaker(tenant_id, service_name, DB_PATH)
+        if not is_allowed:
+            logger.warning("[CB] Action execution rejected: Circuit breaker is active for %s. Reason: %s", service_name, freeze_reason)
+            send_telegram_text(
+                TELEGRAM_CHAT_ID,
+                f"🚨 *SRE Circuit Breaker Aktif* — `{service_name}`\n"
+                f"Denemeler donmuş durumda. Son stabil sürüme geri dönüldü.\n"
+                f"Sebep: `{freeze_reason}`"
+            )
+            return [{"status": "rejected", "reason": f"Circuit breaker active: {freeze_reason}"}]
+
+        # Helper to resolve git repository
+        def get_git_repo(path: Path) -> Optional[Path]:
+            try:
+                p = path.parent
+                res = subprocess.run(
+                    ["git", "-C", str(p), "rev-parse", "--show-toplevel"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if res.returncode == 0:
+                    return Path(res.stdout.strip()).resolve()
+            except Exception:
+                pass
+            return None
+
+        # Keep track of repositories backed up to their created tags
+        backed_up_repos = {}
+        timestamp = str(int(time.time()))
+
         is_self_fix = any(
             act.get("target") and Path(act.get("target")).resolve() == SELF_PATH
             for act in actions
         )
-        timestamp = str(int(time.time()))
-        tag_name = f"pre-fix-{timestamp}"
 
         if is_self_fix:
             if not SELF_FIX_LOCK.acquire(blocking=False):
                 return [{"status": "rejected", "reason": "self-fix already in progress"}]
-            try:
-                # Git Tag backup point creation before modifications
-                subprocess.run(["git", "-C", str(INSTALL_DIR), "tag", "-a", tag_name, "-m", f"SRE pre-fix backup {timestamp}"], check=True)
-                logger.info("Kritik self-fix yedekleme etiketi oluşturuldu: %s", tag_name)
-            except Exception as e:
-                logger.error("Git tag oluşturma hatası: %s", str(e))
-                SELF_FIX_LOCK.release()
-                return [{"status": "failed", "error": f"Git tag yedekleme hatası: {str(e)}"}]
 
         try:
             for act in actions:
@@ -1815,12 +2187,11 @@ class HealingOrchestrator:
                 target   = act.get("target", "").strip()
                 payload  = act.get("payload", "")
 
-                # Security target normalization check (dynamic and platform-agnostic)
+                # Security target normalization check
                 if target:
                     target_path = Path(target).resolve()
                     target_str = str(target_path)
                     
-                    # Dynamically allow installation dir, user home, and service project directories
                     allowed_dirs = {str(INSTALL_DIR.resolve()), str(Path.home().resolve())}
                     for svc in self.manifest.services:
                         for k in ("compose_file", "unit", "app_name"):
@@ -1829,11 +2200,26 @@ class HealingOrchestrator:
                                 allowed_dirs.add(str(Path(v).parent.resolve()))
                                 
                     is_safe = any(target_str.startswith(d) for d in allowed_dirs)
-                    
                     if not is_safe or ".." in target or ".env" in target:
                         logger.warning("Güvenlik engeli: hedef dizin geçersiz veya yasaklı: %s", target)
                         executed.append({"status": "rejected", "reason": "hedef güvenlik engeli"})
                         continue
+
+                    # ── 2. Tag Backups (Layer E) ──
+                    target_repo = get_git_repo(target_path)
+                    if target_repo and target_repo not in backed_up_repos:
+                        tag_name = f"sre-tenant-{tenant_id}-service-{service_name}-{timestamp}"
+                        try:
+                            # Create pre-patch git tag backup point
+                            subprocess.run(["git", "-C", str(target_repo), "tag", "-a", tag_name, "-m", f"SRE pre-fix backup {timestamp}"], check=True)
+                            backed_up_repos[target_repo] = tag_name
+                            logger.info("[BACKUP] Git tag backup created: %s in %s", tag_name, target_repo)
+                        except Exception as tag_ex:
+                            logger.error("[BACKUP] Failed to create git tag backup in %s: %s", target_repo, tag_ex)
+                            # Remove already created tags during this run if one fails
+                            for r_dir, t_name in backed_up_repos.items():
+                                subprocess.run(["git", "-C", str(r_dir), "tag", "-d", t_name], capture_output=True)
+                            return [{"status": "failed", "error": f"Git tag yedekleme hatası: {str(tag_ex)}"}]
 
                 if act_type in ("write", "replace"):
                     target_path = Path(target)
@@ -1846,31 +2232,73 @@ class HealingOrchestrator:
                             replace_str = act.get("replace", "")
                             orig_content = target_path.read_text(encoding="utf-8")
                             count = orig_content.count(search_str)
+                            
                             if count == 0:
                                 raise ValueError(f"Değiştirilecek içerik bulunamadı: {search_str[:50]}")
+                            
+                            # ── 3. Ambiguous Replace Resolver (Layer B) ──
                             if count > 1:
-                                # Satır numarası ipucu varsa doğru eşleşmeyi seç
                                 line_hint = act.get("line_hint")
+                                resolved_via_hint = False
                                 if line_hint:
-                                    lines = orig_content.splitlines(keepends=True)
-                                    target_line = int(line_hint) - 1
-                                    # Hedef satır civarında search_str'i bul
-                                    best_pos = None
-                                    best_dist = float('inf')
-                                    pos = 0
-                                    for i, line in enumerate(lines):
-                                        if search_str in line:
-                                            dist = abs(i - target_line)
-                                            if dist < best_dist:
-                                                best_dist = dist
-                                                best_pos = orig_content.index(search_str, pos)
-                                        pos += len(line)
-                                    if best_pos is not None:
-                                        new_content = orig_content[:best_pos] + replace_str + orig_content[best_pos + len(search_str):]
-                                    else:
-                                        raise ValueError(f"Replace belirsiz: {count} eşleşme, line_hint={line_hint} ile çözülemedi")
-                                else:
-                                    raise ValueError(f"Replace belirsiz: {count} eşleşme bulundu — LLM'e line_hint eklemesi gerekiyor")
+                                    try:
+                                        lines = orig_content.splitlines(keepends=True)
+                                        target_line = int(line_hint) - 1
+                                        best_pos = None
+                                        best_dist = float('inf')
+                                        pos = 0
+                                        for i, line in enumerate(lines):
+                                            if search_str in line:
+                                                dist = abs(i - target_line)
+                                                if dist < best_dist:
+                                                    best_dist = dist
+                                                    best_pos = orig_content.index(search_str, pos)
+                                            pos += len(line)
+                                        if best_pos is not None:
+                                            new_content = orig_content[:best_pos] + replace_str + orig_content[best_pos + len(search_str):]
+                                            resolved_via_hint = True
+                                            logger.info("[REPLACE RESOLVER] Resolved via line_hint=%s", line_hint)
+                                    except Exception as hint_ex:
+                                        logger.warning("[REPLACE RESOLVER] line_hint resolution failed: %s", hint_ex)
+
+                                if not resolved_via_hint:
+                                    logger.info("[REPLACE RESOLVER] Replace belirsiz: %d eşleşme bulundu. LLM'den benzersiz context istenir...", count)
+                                    resolver_prompt = (
+                                        "You are an expert developer. A search-and-replace block matched multiple locations in the file.\n"
+                                        f"Target File: {target}\n"
+                                        f"Original Search Block:\n```\n{search_str}\n```\n"
+                                        f"Original Replace Block:\n```\n{replace_str}\n```\n"
+                                        "Please read the target file contents, and provide an EXPANDED search block that matches "
+                                        "EXACTLY ONE unique location in the target file, along with the corresponding replace block.\n\n"
+                                        "Format your response as a JSON object containing:\n"
+                                        "{\n"
+                                        '  "search": "expanded search string with unique surrounding context",\n'
+                                        '  "replace": "expanded replacement string matching the search string"\n'
+                                        "}\n"
+                                        "Return ONLY the JSON block. Do not include any explanations."
+                                    )
+                                    res, source = self.query_llm_cascade(resolver_prompt, tenant_id, skip_local_pi=True)
+                                    if res:
+                                        try:
+                                            cleaned_res = res.strip()
+                                            if cleaned_res.startswith("```json"):
+                                                cleaned_res = cleaned_res[7:]
+                                            if cleaned_res.endswith("```"):
+                                                cleaned_res = cleaned_res[:-3]
+                                            resolver_data = json.loads(cleaned_res.strip())
+                                            expanded_search = resolver_data.get("search", "")
+                                            expanded_replace = resolver_data.get("replace", "")
+                                            if expanded_search:
+                                                search_str = expanded_search
+                                                replace_str = expanded_replace
+                                                count = orig_content.count(search_str)
+                                                logger.info("[REPLACE RESOLVER] Benzersiz search bloğu bulundu via %s (count=%d)", source, count)
+                                        except Exception as res_ex:
+                                            logger.warning("[REPLACE RESOLVER] LLM yanıtı parse edilemedi: %s", res_ex)
+                                    
+                                    if count > 1:
+                                        raise ValueError(f"Replace belirsiz: {count} eşleşme bulundu ve line_hint yok/çözülemedi")
+                                    new_content = orig_content.replace(search_str, replace_str, 1)
                             else:
                                 new_content = orig_content.replace(search_str, replace_str, 1)
 
@@ -1882,29 +2310,82 @@ class HealingOrchestrator:
                         # Validation — language-agnostic sandbox
                         val_ok, val_err = self.lang_validator.validate(str(tmp_path))
                         if not val_ok:
-                            raise ValueError(f"Syntax Validation Error: {val_err}")
-
-                            if target_path.resolve() == SELF_PATH:
-                                selftest_res = subprocess.run(
-                                    ["python3", str(tmp_path), "--self-test"],
-                                    capture_output=True, text=True, timeout=10
+                            # ── 4. 1-Shot Self-Repair & Intent check (Layer B) ──
+                            logger.warning("[REPAIR] Patch validation failed. Initiating 1-shot self-repair... Error: %s", val_err)
+                            repair_prompt = (
+                                "You are an expert software developer. A code patch resulted in a validation error. "
+                                "You must correct the code to resolve the validation/syntax/semantic error.\n\n"
+                                f"Target File: {target}\n"
+                                f"Validation Error:\n{val_err}\n\n"
+                                f"Proposed Content containing the error:\n"
+                                "```\n"
+                                f"{new_content}\n"
+                                "```\n\n"
+                                "Please output the FULL corrected file content. Your response must contain only the corrected code, "
+                                "enclosed in a markdown code block starting with ```python or the appropriate language block, containing only the code and no explanations."
+                            )
+                            repair_res, repair_source = self.query_llm_cascade(repair_prompt, tenant_id, skip_local_pi=True)
+                            
+                            if repair_res:
+                                cleaned_repair = repair_res.strip()
+                                if cleaned_repair.startswith("```"):
+                                    first_nl = cleaned_repair.find("\n")
+                                    if first_nl != -1:
+                                        cleaned_repair = cleaned_repair[first_nl+1:]
+                                    else:
+                                        cleaned_repair = cleaned_repair[3:]
+                                if cleaned_repair.endswith("```"):
+                                    cleaned_repair = cleaned_repair[:-3]
+                                cleaned_repair = cleaned_repair.strip()
+                                
+                                # Verify intent (Claude Point 1)
+                                is_consistent, verification_reason = self.verify_patch_intent(
+                                    original_patch=payload if act_type == "write" else replace_str,
+                                    repaired_code=cleaned_repair,
+                                    error_context=val_err,
+                                    tenant_id=tenant_id
                                 )
-                                if selftest_res.returncode != 0:
-                                    raise ValueError(f"Self-test hatası: {selftest_res.stderr}")
+                                if not is_consistent:
+                                    logger.warning("[REPAIR] 1-shot self-repair failed intent verification: %s", verification_reason)
+                                    val_err = f"Intent Drift: {verification_reason}"
+                                else:
+                                    with open(tmp_path, "w", encoding="utf-8") as f:
+                                        f.write(cleaned_repair)
+                                        f.flush()
+                                        os.fsync(f.fileno())
+                                    
+                                    val_ok2, val_err2 = self.lang_validator.validate(str(tmp_path))
+                                    if val_ok2:
+                                        logger.info("[REPAIR] 1-shot self-repair SUCCESSFUL! (Source: %s)", repair_source)
+                                        new_content = cleaned_repair
+                                        val_ok = True
+                                        send_telegram_text(
+                                            TELEGRAM_CHAT_ID,
+                                            f"🔧 *1-Shot Self-Repair Başarılı!*\n"
+                                            f"📁 `{md_escape(target)}`\n"
+                                            f"🤖 *Düzeltici*: `{md_escape(repair_source)}`"
+                                        )
+                                    else:
+                                        logger.warning("[REPAIR] 1-shot self-repair failed syntax check: %s", val_err2)
+                                        val_err = val_err2
+                            else:
+                                logger.warning("[REPAIR] 1-shot self-repair failed to get response from LLM.")
+                                
+                            if not val_ok:
+                                raise ValueError(f"Syntax/Semantic Validation Error: {val_err}")
 
+                        # Write patched file atomically
                         atomic_write_text(target_path, new_content)
                         executed.append({"type": act_type, "target": target, "status": "success"})
                         logger.info("Atomic %s successfully applied: %s", act_type, target)
 
-                        # ── AUTO-REBUILD ──────────────────────────────────────────────
-                        # Find which service owns this file and trigger rebuild
+                        # ── 5. Auto-Rebuild & Canary Probe (Layer C) ──
                         try:
                             container_hint = act.get("_container_hint", "")
                             svc_cfg = None
                             if container_hint:
                                 svc_cfg = self.manifest.get_service_by_container(container_hint)
                             if not svc_cfg:
-                                # Fallback: find by path prefix match across manifest services
                                 for svc in self.manifest.services:
                                     cf = svc.get("compose_file", "")
                                     if cf and target.startswith(str(Path(cf).parent)):
@@ -1914,31 +2395,41 @@ class HealingOrchestrator:
                                 logger.info("[REBUILD] Triggering rebuild for service: %s (runtime: %s)",
                                             svc_cfg.get("name"), svc_cfg.get("runtime"))
                                 rb_ok, rb_out = self.rebuild_manager.rebuild(svc_cfg)
+                                
+                                # Canary validation
                                 if rb_ok:
-                                    logger.info("[REBUILD] ✅ Service rebuilt successfully")
-                                    send_telegram_text(
-                                        TELEGRAM_CHAT_ID,
-                                        f"✅ *Patch applied & service rebuilt*\n"
-                                        f"📁 `{md_escape(target)}`\n"
-                                        f"🔄 `{md_escape(svc_cfg.get('name', '?'))}` restarted"
-                                    )
-                                    self.discovery.invalidate(svc_cfg.get("container_name", ""))
+                                    canary_config = svc_cfg.get("limits", {}).get("canary_probe")
+                                    canary_ok = True
+                                    canary_out = "ok"
+                                    if canary_config:
+                                        logger.info("[CANARY] Running active canary probe...")
+                                        canary_ok, canary_out = run_canary_probe(canary_config)
+                                    
+                                    if canary_ok:
+                                        logger.info("[CANARY] ✅ Canary probe passed")
+                                        send_telegram_text(
+                                            TELEGRAM_CHAT_ID,
+                                            f"✅ *Patch applied & service rebuilt*\n"
+                                            f"📁 `{md_escape(target)}`\n"
+                                            f"🔄 `{md_escape(svc_cfg.get('name', '?'))}` restarted & canary OK"
+                                        )
+                                        self.discovery.invalidate(svc_cfg.get("container_name", ""))
+                                    else:
+                                        logger.error("[CANARY] ❌ Canary probe failed: %s", canary_out)
+                                        raise ValueError(f"Canary validation failed: {canary_out}")
                                 else:
-                                    logger.error("[REBUILD] ❌ Rebuild failed: %s", rb_out[:300])
-                                    send_telegram_text(
-                                        TELEGRAM_CHAT_ID,
-                                        f"⚠️ *Patch applied but rebuild failed*\n`{md_escape(rb_out[:200])}`"
-                                    )
+                                    raise ValueError(f"Service rebuild failed: {rb_out[:200]}")
                             else:
                                 logger.info("[REBUILD] No matching service in manifest for %s — skipping auto-rebuild", target)
                         except Exception as rb_ex:
-                            logger.warning("[REBUILD] Auto-rebuild error: %s", rb_ex)
-                        # ── AUTO-REBUILD END ─────────────────────────────────────────
+                            raise ValueError(f"Rebuild/Canary Error: {rb_ex}")
+
                     except Exception as ex:
                         logger.error("Dosya düzenleme hatası: %s", str(ex))
                         if tmp_path.exists():
                             tmp_path.unlink()
                         executed.append({"type": act_type, "target": target, "status": "failed", "error": str(ex)})
+                        raise ex
 
                 elif act_type == "append":
                     try:
@@ -1971,20 +2462,18 @@ class HealingOrchestrator:
                         executed.append({"type": "append", "target": target, "status": "success"})
                     except Exception as ex:
                         executed.append({"type": "append", "target": target, "status": "failed", "error": str(ex)})
+                        raise ex
 
                 elif act_type == "shell":
-                    # Command whitelist filter
                     allowed_patterns = [
                         r"^docker\\s+compose\\s+(up\\s+-d\\s+--build|restart|up\\s+-d)(\\s+[a-zA-Z0-9_-]+)?$",
                         r"^docker\\s+restart\\s+[a-zA-Z0-9_-]+$",
                         r"^systemctl\\s+(restart|start)\\s+[a-zA-Z0-9_.-]+$",
-                        r"^cd\\s+/home/pi/projects/[a-zA-Z0-9_.-]+\\s+&&\\s+docker\\s+compose\\s+(up\\s+-d\\s+--build|restart|up\\s+-d)(\\s+[a-zA-Z0-9_-]+)?$",
+                        r"^cd\\s+/home/pi/projects/[a-zA-Z0-9_.-]+\\s+&&\\\s+docker\\s+compose\\s+(up\\s+-d\\s+--build|restart|up\\s+-d)(\\s+[a-zA-Z0-9_-]+)?$",
                     ]
-                    # Öğrenilmiş dinamik pattern'leri yükle
                     allowed_patterns += _load_learned_patterns()
                     is_allowed = any(re.match(pat, payload) for pat in allowed_patterns)
 
-                    # Tehlikeli karakter kontrolü — LLM'e bile sormadan reddet
                     dangerous_chars = any(char in payload for char in [";", "|", "`", "$", chr(10), chr(13)])
                     if dangerous_chars:
                         executed.append({"type": "shell", "payload": payload, "status": "rejected", "reason": "tehlikeli karakter"})
@@ -2015,24 +2504,21 @@ class HealingOrchestrator:
                             executed.append({"type": "shell", "payload": payload, "status": "failed", "error": result.stderr[:500]})
                     except Exception as ex:
                         executed.append({"type": "shell", "payload": payload, "status": "failed", "error": str(ex)})
+                        raise ex
 
+            # If daemon self-fix, create watchdog
             if is_self_fix:
                 success_count = sum(1 for e in executed if e.get("status") == "success")
                 if success_count == len(actions):
-                    # Commit SRE self-fix changes
                     try:
                         subprocess.run(["git", "-C", str(INSTALL_DIR), "add", "-A"], check=True)
                         diff_check = subprocess.run(["git", "-C", str(INSTALL_DIR), "diff", "--cached", "--quiet"])
-                        if diff_check.returncode == 0:
-                            raise ValueError("Commitlenecek değişiklik yok")
-                        subprocess.run(["git", "-C", str(INSTALL_DIR), "commit", "-m", f"SRE self-fix: {timestamp}"], check=True)
-                        logger.info("SRE self-fix başarıyla commit edildi.")
+                        if diff_check.returncode != 0:
+                            subprocess.run(["git", "-C", str(INSTALL_DIR), "commit", "-m", f"SRE self-fix: {timestamp}"], check=True)
+                            logger.info("SRE self-fix başarıyla commit edildi.")
                     except Exception as e:
                         logger.error("Git commit hatası: %s", str(e))
-                        subprocess.run(["git", "-C", str(INSTALL_DIR), "reset", "--hard", tag_name], capture_output=True)
-                        subprocess.run(["git", "-C", str(INSTALL_DIR), "tag", "-d", tag_name], capture_output=True)
-                        return executed + [{"status": "failed", "error": f"git commit failed: {e}"}]
-                    
+                        
                     # Detached Watchdog Spawning with MainPID and heartbeat checks
                     watchdog_script = fr"""(
                       sleep 10
@@ -2054,18 +2540,14 @@ class HealingOrchestrator:
                         echo "Stabilization check passed." >> {INSTALL_DIR / 'watchdog.log'}
                       else
                         echo "Unstable service detected. Rolling back..." >> {INSTALL_DIR / 'watchdog.log'}
-                        echo "Rollback to {tag_name}" > {INSTALL_DIR / 'watchdog_rollback.flag'}
-                        git -C {INSTALL_DIR} reset --hard {tag_name} >> {INSTALL_DIR / 'watchdog.log'} 2>&1
+                        echo "Rollback to pre-fix-{timestamp}" > {INSTALL_DIR / 'watchdog_rollback.flag'}
+                        git -C {INSTALL_DIR} reset --hard pre-fix-{timestamp} >> {INSTALL_DIR / 'watchdog.log'} 2>&1
                         sudo /usr/bin/systemctl restart sre-daemon >> {INSTALL_DIR / 'watchdog.log'} 2>&1
-                        git -C {INSTALL_DIR} tag -d {tag_name} >> {INSTALL_DIR / 'watchdog.log'} 2>&1
-                        curl -s -X POST "https://api.telegram.org/bot\${{TELEGRAM_BOT_TOKEN}}/sendMessage" \
-                          -d "chat_id=\${{TELEGRAM_CHAT_ID}}" \
-                          -d "text=⚠️ *SRE Watchdog*: Rollback tetiklendi! Servis stabilize olamadı, {tag_name} etiketine geri dönüldü." \
-                          > /dev/null 2>&1
+                        git -C {INSTALL_DIR} tag -d pre-fix-{timestamp} >> {INSTALL_DIR / 'watchdog.log'} 2>&1
+                        curl -s -X POST "https://api.telegram.org/bot\${{TELEGRAM_BOT_TOKEN}}/sendMessage"                           -d "chat_id=\${{TELEGRAM_CHAT_ID}}"                           -d "text=⚠️ *SRE Watchdog*: Rollback tetiklendi! Servis stabilize olamadı, pre-fix-{timestamp} etiketine geri dönüldü."                           > /dev/null 2>&1
                       fi
                     ) &"""
 
-                    # Pass credentials safely through environment variables
                     env_pass = os.environ.copy()
                     env_pass["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
                     env_pass["TELEGRAM_CHAT_ID"] = TELEGRAM_CHAT_ID
@@ -2079,21 +2561,45 @@ class HealingOrchestrator:
                         env=env_pass
                     )
 
-                    # Trigger the restart of SRE Daemon
                     logger.info("Daemon restart ediliyor...")
                     subprocess.Popen(["sudo", "/usr/bin/systemctl", "restart", "sre-daemon"])
-                else:
-                    logger.warning("Tüm self-fix eylemleri başarılı olamadı, rollback yapılıyor...")
-                    subprocess.run(["git", "-C", str(INSTALL_DIR), "reset", "--hard", tag_name], capture_output=True)
-                    subprocess.run(["git", "-C", str(INSTALL_DIR), "tag", "-d", tag_name], capture_output=True)
+
+            # Log successful outcome (Layer D)
+            log_repair_attempt(tenant_id, service_name, "success", db_path=DB_PATH)
+            
+            # Remove backup tags since everything passed
+            for repo_dir, tag in backed_up_repos.items():
+                try:
+                    subprocess.run(["git", "-C", str(repo_dir), "tag", "-d", tag], capture_output=True)
+                except Exception:
+                    pass
+
             return executed
+
+        except Exception as overall_ex:
+            logger.warning("[ROLLBACK] Action failed, executing safe rollbacks to tags...")
+            
+            # Log failure outcome (Layer D)
+            log_repair_attempt(
+                tenant_id=tenant_id,
+                service_name=service_name,
+                outcome="repair_failed",
+                error_summary=str(overall_ex),
+                db_path=DB_PATH
+            )
+
+            # Rollback repositories
+            for repo_dir, tag in backed_up_repos.items():
+                self.safe_rollback(tenant_id, service_name, repo_dir, tag)
+                
+            return executed + [{"status": "failed", "error": str(overall_ex)}]
         finally:
             if is_self_fix and SELF_FIX_LOCK.locked():
                 try:
+                    # Non-blocking release
                     SELF_FIX_LOCK.release()
                 except RuntimeError:
                     pass
-
     def _write_heal_log(self, error, fix, source, success, tag, actions=None):
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),

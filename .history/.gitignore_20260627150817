@@ -1,0 +1,40 @@
+# Environment variables & secrets
+.env
+.env.*
+.env.local
+
+# Databases & local state
+*.db
+sre_state.db
+
+# Logs & monitoring
+*.log
+daemon.log
+watchdog.log
+heal_log.jsonl
+
+# Python cache & build directories
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+venv/
+.venv/
+env/
+
+# OS specific files
+.DS_Store
+.DS_Store?
+Thumbs.db
+
+# Local heartbeat and temp files
+.heartbeat
+*.__sre_tmp__*
+
+# Video assets
+*.mp4
+*.mov
+*.gif
+
+
