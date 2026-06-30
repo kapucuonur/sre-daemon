@@ -221,6 +221,10 @@ def check_failed_heal_history():
             """)
             row = cur.fetchone()
             if row:
+                project_tag = row["project_tag"] or ""
+                error_message = row["error_message"] or ""
+                if "jan" in project_tag.lower() or "jan" in error_message.lower():
+                    return None
                 data = {
                     "error_message": row["error_message"],
                     "project_tag": row["project_tag"],
