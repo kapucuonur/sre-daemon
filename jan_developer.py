@@ -642,6 +642,8 @@ IMPORTANT RULES:
 3. Do NOT import non-standard external math libraries (like numpy, pandas, sklearn, or scipy). Write the trend-line slope calculation in pure Python using simple arithmetic (e.g., least squares slope = covariance(x,y)/variance(x)). This ensures zero external dependencies and zero ImportError.
 4. Ensure all helper methods, imports, and variables you use are fully defined or imported.
 5. Do NOT guess or invent class names (like SREDaemon). Use the actual class names shown in the [CODE CONTEXT SKELETON] and [CODE CONTEXT] (e.g., MetricsCollector for metric collection and analysis).
+6. When writing unit tests for MetricsCollector, remember that its __init__ constructor requires an orchestrator argument. You can instantiate it in tests using a mock object, e.g. collector = MetricsCollector(MagicMock()).
+
 
 
 Output your response strictly as an XML document using CDATA blocks for search and replace code segments, like this:
