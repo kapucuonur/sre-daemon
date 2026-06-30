@@ -626,21 +626,30 @@ Description: {desc}
 {code_context}
 
 You must write clean, correct, and robust code for the feature.
-If you need to add a new method to a class (e.g. SREDaemon or MetricsCollector), find a suitable method definition in the code context, and write a search/replace block replacing that definition with the definition + your new method!
-Make sure your search block matches the code context EXACTLY (including line indentation). Do not include line numbers in the search or replace blocks.
-You must also write a corresponding unit test to verify the new feature works. If you create a new test file (e.g. 'tests/test_predictive.py'), set 'search': "" and target: "tests/test_predictive.py" and put the complete content of the file in 'replace'.
+IMPORTANT RULES:
+1. Do NOT nest your new methods/functions inside existing functions.
+2. If you are adding a class method (e.g. to SREDaemon or MetricsCollector), find a method definition of that class in the [CODE CONTEXT], and replace that method with the original method + your new method at the same indentation level.
+3. Do NOT import non-standard external math libraries (like numpy, pandas, sklearn, or scipy). Write the trend-line slope calculation in pure Python using simple arithmetic (e.g., least squares slope = covariance(x,y)/variance(x)). This ensures zero external dependencies and zero ImportError.
+4. Ensure all helper methods, imports, and variables you use are fully defined or imported.
 
 Output your response strictly as an XML document using CDATA blocks for search and replace code segments, like this:
 <patches>
   <patch>
     <target>sre_daemon.py</target>
     <search><![CDATA[
-def get_daemon_setting(key: str, default: str = "") -> str:
-    ]]></search>
+    def _handle_predictive_fix(self, entity: str, metric_type: str, current_val: float, ema_val: float):
+        # ... original code ...
+        # ... original code ...
+]]></search>
     <replace><![CDATA[
-def get_daemon_setting(key: str, default: str = "") -> str:
-    # new feature method here
-    ]]></replace>
+    def _handle_predictive_fix(self, entity: str, metric_type: str, current_val: float, ema_val: float):
+        # ... original code ...
+        # ... original code ...
+
+    def predict_scaling_advisor(self):
+        # your new method at class-level indentation (same indentation as _handle_predictive_fix)
+        pass
+]]></replace>
   </patch>
   <patch>
     <target>tests/test_predictive.py</target>
