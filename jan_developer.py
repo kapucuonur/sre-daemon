@@ -281,7 +281,7 @@ Output your response strictly as a JSON object of this format (do not include ma
     cleaned = cleaned.strip()
 
     try:
-        patch_data = json.loads(cleaned)
+        patch_data = json.loads(cleaned, strict=False)
         patches = patch_data.get("patches", [])
         if not patches:
             log_error("No patches found in LLM response.")
@@ -480,7 +480,7 @@ Output your response strictly as a JSON object of this format (do not include ma
     cleaned = cleaned.strip()
 
     try:
-        patch_data = json.loads(cleaned)
+        patch_data = json.loads(cleaned, strict=False)
         patches = patch_data.get("patches", [])
         if not patches:
             log_error("No patches found in LLM response.")
@@ -595,6 +595,12 @@ Output your response strictly as a JSON object of this format (do not include ma
 
     except Exception as ex:
         log_error(f"An error occurred during feature implementation: {ex}")
+        try:
+            features[pending_idx]["status"] = "failed"
+            with open(FEATURES_JSON, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
         # Rollback as last resort
         try:
             subprocess.run(["git", "-C", str(INSTALL_DIR), "checkout", "--", "."], check=True)
