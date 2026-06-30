@@ -40,6 +40,12 @@ curl -sSL https://sre.trihonor.com/install.sh | SRE_API_KEY=sre_live_xxxxxxxxxxx
 
 ## Key Concepts
 
+### 🚀 Autonomous SRE Daemon (New!)
+The SRE Daemon now features an integrated **Health Monitoring & Self-Healing** engine:
+* **Self-Monitoring:** Continuously tracks system health and logs performance metrics in real-time.
+* **Auto-Heal:** Automatically detects failure patterns via the `_heal()` orchestration layer to stabilize services without human intervention.
+* **Real-time Alerts:** Integrated Telegram/Slack reporting for critical infrastructure state changes and recovery outcomes.
+
 * **Cognitive SRE (Predictive Maintenance)**: Moving beyond reactive log-healing, SRE Daemon continuously analyzes system and container metrics (CPU/RAM/Disk), detects exponential growth trends via Exponential Moving Averages (EMA), and executes pre-emptive restarts or optimizations before outages occur.
 * **Human-in-the-Loop (HITL)**: A safety gate where the AI proposes a code patch, but awaits explicit human confirmation (via Telegram buttons or Slack actions) before executing it in production.
 * **Strategy Registry (Fuzzy Semantic Matching)**: Traceback signatures and successful commands are indexed in `sre_state.db`. If an exact hash miss occurs, a fuzzy semantic match (`difflib` > 82%) applies existing strategies across different containers, achieving **0-token cost** for similar problems.
