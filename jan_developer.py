@@ -187,6 +187,34 @@ def check_failed_heal_history():
         log_error(f"Failed to query heal_history DB: {e}")
     return None
 
+def extract_relevant_context(error_context, source_code):
+    lines = source_code.splitlines()
+    matches = re.findall(r'sre_daemon\.py", line (\d+)', error_context)
+    if not matches:
+        matches = re.findall(r'line (\d+)', error_context)
+    
+    if not matches:
+        return "No specific code lines could be resolved from the traceback context."
+        
+    extracted_sections = []
+    for line_str in set(matches):
+        try:
+            line_no = int(line_str)
+            start = max(0, line_no - 50)
+            end = min(len(lines), line_no + 50)
+            segment = "\n".join(f"{idx+1}: {lines[idx]}" for idx in range(start, end))
+            extracted_sections.append(
+                f"--- Code surrounding line {line_no} in sre_daemon.py ---\n"
+                f"{segment}\n"
+            )
+        except Exception:
+            pass
+            
+    if not extracted_sections:
+        return "No specific code lines could be resolved from the traceback context."
+        
+    return "\n".join(extracted_sections)
+
 def analyze_and_patch(error_context, failed_history=None):
     """Asks the LLM to write a patch for sre_daemon.py based on the failure context."""
     log_info("Starting self-evolution analysis...")
@@ -200,12 +228,17 @@ def analyze_and_patch(error_context, failed_history=None):
     with open(sre_daemon_path, "r", encoding="utf-8") as f:
         source_code = f.read()
 
+    code_context = extract_relevant_context(error_context, source_code)
+
     # Formulate prompt
     prompt = f"""You are Jan, the self-evolving AI SRE developer agent.
-Your primary task is to fix a bug in 'sre_daemon.py' based on the failure context below.
+Your primary task is to fix a bug in 'sre_daemon.py' based on the failure context and code context below.
 
 [FAILURE CONTEXT]
 {error_context}
+
+[CODE CONTEXT FROM SRE_DAEMON.PY]
+{code_context}
 """
 
     if failed_history:
@@ -218,8 +251,8 @@ Your primary task is to fix a bug in 'sre_daemon.py' based on the failure contex
 """
 
     prompt += """
-Please analyze 'sre_daemon.py' and produce a search-and-replace patch block to resolve this bug.
-Your patch must be structurally sound and completely fix the root cause (e.g., path resolution issues, type errors, NameErrors).
+Please analyze the code context, identify the root cause of the failure, and produce a search-and-replace patch block to resolve the bug in 'sre_daemon.py'.
+Make sure your search block matches the code context EXACTLY (including line indentation). Do not include line numbers in the search or replace blocks.
 
 Output your response strictly as a JSON object of this format (do not include markdown wrapper blocks or explanations):
 {
