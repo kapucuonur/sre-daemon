@@ -645,11 +645,12 @@ Description: {desc}
 You must write clean, correct, and robust code for the feature.
 IMPORTANT RULES:
 1. Do NOT nest your new methods/functions inside existing functions.
-2. If you are adding a class method (e.g. to SREDaemon or MetricsCollector), find a method definition of that class in the [CODE CONTEXT], and replace that method with the original method + your new method at the same indentation level.
+2. If you are adding a class method (e.g. to MetricsCollector), do NOT search for "class MetricsCollector:". Instead, search for the exact class header declaration (e.g., "class MetricsCollector(threading.Thread):") or search for an existing method definition in that class (e.g., "def _check_anomaly(self, entity: str, metric_type: str, current_val: float):") and replace it with the original method/declaration + your new method at the same indentation level.
 3. Do NOT import non-standard external math libraries (like numpy, pandas, sklearn, or scipy). Write the trend-line slope calculation in pure Python using simple arithmetic (e.g., least squares slope = covariance(x,y)/variance(x)). This ensures zero external dependencies and zero ImportError.
 4. Ensure all helper methods, imports, and variables you use are fully defined or imported.
 5. Do NOT guess or invent class names (like SREDaemon). Use the actual class names shown in the [CODE CONTEXT SKELETON] and [CODE CONTEXT] (e.g., MetricsCollector for metric collection and analysis).
 6. When writing unit tests for MetricsCollector, remember that its __init__ constructor requires an orchestrator argument. You can instantiate it in tests using a mock object, e.g. collector = MetricsCollector(MagicMock()).
+
 
 
 
