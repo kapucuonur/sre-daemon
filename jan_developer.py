@@ -279,6 +279,8 @@ Output your response strictly as a JSON object of this format (do not include ma
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
     cleaned = cleaned.strip()
+    cleaned = re.sub(r'"""', '"', cleaned)
+    cleaned = re.sub(r"'''", '"', cleaned)
 
     try:
         patch_data = json.loads(cleaned, strict=False)
@@ -540,6 +542,8 @@ Output your response strictly as a JSON object of this format (do not include ma
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
     cleaned = cleaned.strip()
+    cleaned = re.sub(r'"""', '"', cleaned)
+    cleaned = re.sub(r"'''", '"', cleaned)
 
     try:
         patch_data = json.loads(cleaned, strict=False)
