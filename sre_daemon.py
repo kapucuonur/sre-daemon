@@ -3369,12 +3369,6 @@ def _validate_env():
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN eksik, bildirimler pasif.")
 
-if __name__ == "__main__":
-    if "--self-test" in sys.argv:
-        print("self-test-ok")
-        sys.exit(0)
-    main()
-
 def git_auto_sync():
     import subprocess
     try:
@@ -3405,3 +3399,11 @@ def monitor_health():
         return True
     except Exception as e:
         return False
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        print("self-test-ok")
+        sys.exit(0)
+    main()
+
