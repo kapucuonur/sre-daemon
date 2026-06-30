@@ -1357,7 +1357,7 @@ def check_circuit_breaker(tenant_id: str, service_name: str, db_path: Path = DB_
             fail_count = conn.execute(
                 """SELECT COUNT(*) FROM repair_attempts
                    WHERE tenant_id=? AND service_name=? AND attempted_at > ?
-                   AND outcome = 'repair_failed'""",
+                   AND outcome != 'success'""",
                 (tenant_id, service_name, fifteen_min_ago)
             ).fetchone()[0]
 
@@ -1555,7 +1555,6 @@ class HealingOrchestrator:
                 f"📍 *Tenant/Servis*: `{tenant_id}/{service_name}`\n"
                 f"Etikete geri dönüldü: `{target_tag}`"
             )
-            log_repair_attempt(tenant_id, service_name, "rolled_back", db_path=DB_PATH)
             return True
         except Exception as e:
             # Rollback failed — son çare (last resort): stop service, send P0 page
@@ -1581,7 +1580,6 @@ class HealingOrchestrator:
                 f"Service STOPPED as last resort. Manual intervention required!\n"
                 f"Hata: `{md_escape(str(e))}`"
             )
-            log_repair_attempt(tenant_id, service_name, "rolled_back", error_summary=f"CRITICAL ROLLBACK FAILURE: {e}", db_path=DB_PATH)
             return False
 
     def handle_error(self, tagged_line: str, project_tag: str, err_hash: str = None):
