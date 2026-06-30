@@ -2998,78 +2998,89 @@ def telegram_poller():
             for update in updates:
                 offset = update.get("update_id", 0) + 1
                 
-                # 1. Handle Messages / Commands
-                message = update.get("message")
-                if message:
-                    chat_id = str(message.get("chat", {}).get("id", ""))
+                # 1. Handle Messages / Commands (and Channel Posts)
+                msg_obj = update.get("message") or update.get("channel_post")
+                if msg_obj:
+                    chat_id = str(msg_obj.get("chat", {}).get("id", ""))
                     if chat_id != TELEGRAM_CHAT_ID:
-                        logger.warning("Güvenlik engeli: whitelist dışı chat_id mesajı: %s", chat_id)
+                        # Allow filtering by whitelist chat_id
                         continue
                     
-                    text = message.get("text", "").strip()
-                    if text.startswith("/"):
-                        cmd_parts = text.split()
-                        cmd = cmd_parts[0].lower()
-                        
-                        if cmd == "/status":
-                            status_msg = get_telegram_status_report()
-                            send_telegram_text(chat_id, status_msg)
-                        elif cmd == "/autonomous":
-                            if len(cmd_parts) > 1:
-                                sub = cmd_parts[1].lower()
-                                if sub == "on":
-                                    set_daemon_setting("autonomous_mode", "1")
-                                    send_telegram_text(chat_id, "✅ *SRE Otonom Mod Aktif Edildi.*")
-                                elif sub == "off":
-                                    set_daemon_setting("autonomous_mode", "0")
-                                    send_telegram_text(chat_id, "❌ *SRE Otonom Mod Devre Dışı Bırakıldı.*")
-                                else:
-                                    send_telegram_text(chat_id, "Geçersiz parametre. Kullanım: `/autonomous on` veya `/autonomous off`")
-                            else:
-                                mode = get_daemon_setting("autonomous_mode", "0")
-                                status_label = "Açık (Otonom) 🤖" if mode == "1" else "Kapalı (Onay Bekler) 👥"
-                                send_telegram_text(chat_id, f"🤖 *SRE Otonom Mod Durumu*: `{status_label}`\n\nAçmak için: `/autonomous on`\nKapatmak için: `/autonomous off`")
-                        elif cmd == "/history":
-                            try:
-                                with sqlite3.connect(DB_PATH) as conn:
-                                    conn.row_factory = sqlite3.Row
-                                    cur = conn.cursor()
-                                    cur.execute("SELECT project_tag, success, duration_seconds, created_at FROM heal_history ORDER BY id DESC LIMIT 5")
-                                    rows = cur.fetchall()
-                                    if not rows:
-                                        send_telegram_text(chat_id, "📝 *Onarım geçmişi temiz.*")
+                    text = msg_obj.get("text", "").strip()
+                    if text:
+                        if text.startswith("/"):
+                            cmd_parts = text.split()
+                            cmd = cmd_parts[0].lower()
+                            
+                            if cmd == "/status":
+                                status_msg = get_telegram_status_report()
+                                send_telegram_text(chat_id, status_msg)
+                            elif cmd == "/autonomous":
+                                if len(cmd_parts) > 1:
+                                    sub = cmd_parts[1].lower()
+                                    if sub == "on":
+                                        set_daemon_setting("autonomous_mode", "1")
+                                        send_telegram_text(chat_id, "✅ *SRE Otonom Mod Aktif Edildi.*")
+                                    elif sub == "off":
+                                        set_daemon_setting("autonomous_mode", "0")
+                                        send_telegram_text(chat_id, "❌ *SRE Otonom Mod Devre Dışı Bırakıldı.*")
                                     else:
-                                        msg = "📊 *Son Onarım Girişimleri*:\n\n"
-                                        for r in rows:
-                                            status = "✅ Başarılı" if r["success"] else "❌ Başarısız"
-                                            dt = r["created_at"][:16].replace("T", " ")
-                                            msg += f"• *{md_escape(r['project_tag'])}* - {status} ({r['duration_seconds']:.1f}s) - _{dt}_\n"
-                                        send_telegram_text(chat_id, msg)
-                            except Exception as e:
-                                send_telegram_text(chat_id, f"Hata: {str(e)}")
-                        elif cmd == "/help":
-                            help_msg = (
-                                "🤖 *SRE Daemon Assistant*\n\n"
-                                "Mevcut komutlar:\n"
-                                "• `/status` - Sistem sağlığı, disk, RAM, sıcaklık ve konteyner durumlarını sorgular.\n"
-                                "• `/autonomous` - Otonom mod durumunu gösterir. (Kullanım: `/autonomous on` veya `/autonomous off`)\n"
-                                "• `/history` - Son onarım geçmişini gösterir.\n"
-                                "• `/help` - Bu yardım mesajını gösterir."
-                            )
-                            send_telegram_text(chat_id, help_msg)
-                    else:
-                        # Hata çıktısı veya traceback gönderildiyse otonom analizi tetikle
-                        text_lower = text.lower()
-                        if any(k in text_lower for k in ["traceback", "error", "exception", "failed", "hata", "başarısız"]):
-                            send_telegram_text(chat_id, "🔍 *Telegram üzerinden gönderilen hata günlüğü analiz ediliyor ve onarım başlatılıyor...*")
-                            orchestrator = HealingOrchestrator()
-                            threading.Thread(
-                                target=orchestrator.handle_error,
-                                args=(text, "[Telegram-Manual]"),
-                                daemon=True
-                            ).start()
+                                        send_telegram_text(chat_id, "Geçersiz parametre. Kullanım: `/autonomous on` veya `/autonomous off`")
+                                else:
+                                    mode = get_daemon_setting("autonomous_mode", "0")
+                                    status_label = "Açık (Otonom) 🤖" if mode == "1" else "Kapalı (Onay Bekler) 👥"
+                                    send_telegram_text(chat_id, f"🤖 *SRE Otonom Mod Durumu*: `{status_label}`\n\nAçmak için: `/autonomous on`\nKapatmak için: `/autonomous off`")
+                            elif cmd == "/history":
+                                try:
+                                    with sqlite3.connect(DB_PATH) as conn:
+                                        conn.row_factory = sqlite3.Row
+                                        cur = conn.cursor()
+                                        cur.execute("SELECT project_tag, success, duration_seconds, created_at FROM heal_history ORDER BY id DESC LIMIT 5")
+                                        rows = cur.fetchall()
+                                        if not rows:
+                                            send_telegram_text(chat_id, "📝 *Onarım geçmişi temiz.*")
+                                        else:
+                                            msg = "📊 *Son Onarım Girişimleri*:\n\n"
+                                            for r in rows:
+                                                status = "✅ Başarılı" if r["success"] else "❌ Başarısız"
+                                                dt = r["created_at"][:16].replace("T", " ")
+                                                msg += f"• *{md_escape(r['project_tag'])}* - {status} ({r['duration_seconds']:.1f}s) - _{dt}_\n"
+                                            send_telegram_text(chat_id, msg)
+                                except Exception as e:
+                                    send_telegram_text(chat_id, f"Hata: {str(e)}")
+                            elif cmd == "/help":
+                                help_msg = (
+                                    "🤖 *SRE Daemon Assistant*\n\n"
+                                    "Mevcut komutlar:\n"
+                                    "• `/status` - Sistem sağlığı, disk, RAM, sıcaklık ve konteyner durumlarını sorgular.\n"
+                                    "• `/autonomous` - Otonom mod durumunu gösterir. (Kullanım: `/autonomous on` veya `/autonomous off`)\n"
+                                    "• `/history` - Son onarım geçmişini gösterir.\n"
+                                    "• `/help` - Bu yardım mesajını gösterir."
+                                )
+                                send_telegram_text(chat_id, help_msg)
                         else:
-                            send_telegram_text(chat_id, "❓ *Bilinmeyen Mesaj.*\nYardım almak için `/help` yazabilirsiniz veya analiz edilmesi için bir hata logunu/traceback çıktısını doğrudan gönderebilirsiniz.")
+                            # Hata çıktısı veya traceback gönderildiyse otonom analizi tamamen sessiz/otomatik olarak tetikle!
+                            text_lower = text.lower()
+                            error_indicators = [
+                                "traceback", "error", "exception", "failed", "hata", "başarısız", 
+                                "alert", "crash", "kararsızlık", "uyarı", "warning", "critical", 
+                                "log analyst", "sre daemon"
+                            ]
+                            if any(k in text_lower for k in error_indicators):
+                                import re
+                                project_tag = "[Telegram-Redirect]"
+                                match_where = re.search(r'(?:Nerede|Where):\s*([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
+                                if match_where:
+                                    project_tag = f"[{match_where.group(1)}]"
+                                
+                                logger.info("[TELEGRAM-REDIRECT] Auto-ingesting error message from Telegram chat for %s", project_tag)
+                                orchestrator = HealingOrchestrator()
+                                threading.Thread(
+                                    target=orchestrator.handle_error,
+                                    args=(text, project_tag),
+                                    daemon=True
+                                ).start()
+
 
                 
                 # 2. Handle Inline Buttons (Callback Queries)
