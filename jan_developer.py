@@ -409,10 +409,11 @@ def get_daemon_setting(key: str, default: str = "") -> str:
 
     log_info(f"LLM cascade response received from {provider}.")
     try:
-        with open(INSTALL_DIR / "jan_last_patch_response.txt", "w") as rf:
+        with open(INSTALL_DIR / "jan_last_patch_response.log", "w") as rf:
             rf.write(response_text)
     except Exception:
         pass
+
 
 
     patches = parse_xml_patches(response_text)
@@ -692,7 +693,7 @@ import unittest
 
     log_info(f"LLM cascade response received from {provider}.")
     try:
-        with open(INSTALL_DIR / "jan_last_patch_response.txt", "w") as rf:
+        with open(INSTALL_DIR / "jan_last_patch_response.log", "w") as rf:
             rf.write(response_text)
     except Exception:
         pass
