@@ -611,11 +611,21 @@ def check_features_pipeline():
     with open(sre_daemon_path, "r", encoding="utf-8") as f:
         source_code = f.read()
 
+    classes_in_file = []
+    for line in source_code.splitlines():
+        if line.startswith("class "):
+            parts = line.split("class ")[1].split("(")[0].split(":")[0].strip()
+            classes_in_file.append(parts)
+    classes_list_str = "\n".join(f"- {c}" for c in classes_in_file)
+
     code_context = extract_feature_context(source_code, title, desc)
 
     # Formulate prompt for new features
     prompt = f"""You are Jan, the self-evolving AI SRE developer agent.
 Your primary task is to implement a new feature in 'sre_daemon.py' and its corresponding tests based on the feature request and the code context below.
+
+[CLASSES DEFINED IN SRE_DAEMON.PY]
+{classes_list_str}
 
 [FEATURE REQUEST]
 ID: {feat_id}
