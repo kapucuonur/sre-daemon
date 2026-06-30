@@ -2009,7 +2009,7 @@ class HealingOrchestrator:
                                             f"🔄 *SRE Failure Analysis — Alternatif Fix Başarılı*\n"
                                             f"📍 *Servis*: `{md_escape(project_tag)}`\n"
                                             f"🤖 *Kaynak*: `{md_escape(retry_source)}`\n"
-                                            f"Sistem alternatif stratejiyle stabilize edildi\."
+                                            f"Sistem alternatif stratejiyle stabilize edildi."
                                         )
                                     else:
                                         logger.warning("[FAILURE-ANALYSIS] Alternative fix also failed. Giving up.")
