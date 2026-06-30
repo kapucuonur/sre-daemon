@@ -3395,7 +3395,8 @@ def monitor_health():
         log_entry = f"HEALTH_CHECK: Failure Rate: {error_rate:.2%} | Status: {status}"
         with open("health_check.log", "a") as f:
             f.write(log_entry + chr(10))
-        if error_rate > 0.5: _heal()
+        if error_rate > 0.5:
+            logger.error("System error rate too high: {:.2%}".format(error_rate))
         return True
     except Exception as e:
         return False
