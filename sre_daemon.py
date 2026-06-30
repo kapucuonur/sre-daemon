@@ -2594,7 +2594,12 @@ class HealingOrchestrator:
                         if cmd_args[0] == "systemctl":
                             cmd_args = ["sudo", "/usr/bin/systemctl"] + cmd_args[1:]
                         
-                        result = subprocess.run(cmd_args, cwd=target if target else None, capture_output=True, text=True, timeout=60)
+                        cwd_dir = None
+                        if target:
+                            t_path = Path(target)
+                            cwd_dir = str(t_path.parent) if t_path.is_file() else str(t_path)
+                        
+                        result = subprocess.run(cmd_args, cwd=cwd_dir, capture_output=True, text=True, timeout=60)
                         if result.returncode == 0:
                             executed.append({"type": "shell", "payload": payload, "status": "success", "stdout": result.stdout[:500]})
                         else:
