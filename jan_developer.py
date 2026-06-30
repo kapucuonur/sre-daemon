@@ -9,6 +9,61 @@ import subprocess
 import requests
 from pathlib import Path
 from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
+
+def parse_xml_patches(xml_text):
+    """
+    Parses XML code modification patches, returning a list of patch dicts.
+    Uses standard ET parsing and falls back to regex in case of minor XML structure issues.
+    """
+    cleaned = xml_text.strip()
+    if cleaned.startswith("```xml"):
+        cleaned = cleaned[6:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+
+    if not cleaned.startswith("<patches>"):
+        if cleaned.startswith("<patch>"):
+            cleaned = f"<patches>{cleaned}</patches>"
+        else:
+            p_idx = cleaned.find("<patch>")
+            if p_idx != -1:
+                cleaned = f"<patches>{cleaned[p_idx:]}"
+                if not cleaned.endswith("</patches>"):
+                    cleaned += "</patches>"
+
+    patches = []
+    try:
+        root = ET.fromstring(cleaned)
+        for patch_node in root.findall("patch"):
+            target_node = patch_node.find("target")
+            target = target_node.text.strip() if target_node is not None and target_node.text else ""
+            
+            search_node = patch_node.find("search")
+            search_val = search_node.text if search_node is not None and search_node.text else ""
+            
+            replace_node = patch_node.find("replace")
+            replace_val = replace_node.text if replace_node is not None and replace_node.text else ""
+            
+            patches.append({
+                "target": target,
+                "search": search_val,
+                "replace": replace_val
+            })
+    except Exception as e:
+        log_error(f"XML Standard Parser failed ({e}), falling back to Regex parser.")
+        matches = re.findall(r'<patch>\s*<target>(.*?)</target>\s*<search>\s*<!\[CDATA\[(.*?)]]>\s*</search>\s*<replace>\s*<!\[CDATA\[(.*?)]]>\s*</replace>\s*</patch>', cleaned, re.DOTALL)
+        for m in matches:
+            patches.append({
+                "target": m[0].strip(),
+                "search": m[1],
+                "replace": m[2]
+            })
+            
+    return patches
 
 # Path Configuration
 INSTALL_DIR       = Path("/home/pi/sre")
@@ -254,15 +309,19 @@ Your primary task is to fix a bug in 'sre_daemon.py' based on the failure contex
 Please analyze the code context, identify the root cause of the failure, and produce a search-and-replace patch block to resolve the bug in 'sre_daemon.py'.
 Make sure your search block matches the code context EXACTLY (including line indentation). Do not include line numbers in the search or replace blocks.
 
-Output your response strictly as a JSON object of this format (do not include markdown wrapper blocks or explanations):
-{
-  "patches": [
-    {
-      "search": "exact code lines to replace",
-      "replace": "new corrected code lines"
-    }
-  ]
-}
+Output your response strictly as an XML document using CDATA blocks for search and replace code segments, like this:
+<patches>
+  <patch>
+    <target>sre_daemon.py</target>
+    <search><![CDATA[
+def get_daemon_setting(key: str, default: str = "") -> str:
+    ]]></search>
+    <replace><![CDATA[
+def get_daemon_setting(key: str, default: str = "") -> str:
+    # new corrected logic here
+    ]]></replace>
+  </patch>
+</patches>
 """
 
     response_text, provider = query_llm_cascade(prompt)
@@ -272,30 +331,14 @@ Output your response strictly as a JSON object of this format (do not include ma
 
     log_info(f"LLM cascade response received from {provider}.")
 
-    # Clean JSON markers if present
-    cleaned = response_text.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
-    cleaned = re.sub(r'"""', '"', cleaned)
-    cleaned = re.sub(r"'''", '"', cleaned)
-
-    try:
-        patch_data = json.loads(cleaned, strict=False)
-    except Exception as parse_err:
-        log_error(f"Failed to parse LLM JSON in analyze_and_patch: {parse_err}")
+    patches = parse_xml_patches(response_text)
+    if not patches:
+        log_error("No valid XML patches could be parsed.")
         with open(INSTALL_DIR / "jan_raw_response.txt", "w") as rf:
             rf.write(response_text)
-        raise parse_err
+        return False
 
     try:
-        patches = patch_data.get("patches", [])
-        if not patches:
-            log_error("No patches found in LLM response.")
-            return False
-
         # Apply patches atomically
         applied_count = 0
         for p in patches:
@@ -509,21 +552,27 @@ If you need to add a new method to a class (e.g. SREDaemon or MetricsCollector),
 Make sure your search block matches the code context EXACTLY (including line indentation). Do not include line numbers in the search or replace blocks.
 You must also write a corresponding unit test to verify the new feature works. If you create a new test file (e.g. 'tests/test_predictive.py'), set 'search': "" and target: "tests/test_predictive.py" and put the complete content of the file in 'replace'.
 
-Output your response strictly as a JSON object of this format (do not include markdown wrapper blocks or explanations):
-{{
-  "patches": [
-    {{
-      "target": "sre_daemon.py",
-      "search": "exact code lines to replace",
-      "replace": "new corrected code lines"
-    }},
-    {{
-      "target": "tests/test_predictive.py",
-      "search": "",
-      "replace": "complete content of the new test file"
-    }}
-  ]
-}}
+Output your response strictly as an XML document using CDATA blocks for search and replace code segments, like this:
+<patches>
+  <patch>
+    <target>sre_daemon.py</target>
+    <search><![CDATA[
+def get_daemon_setting(key: str, default: str = "") -> str:
+    ]]></search>
+    <replace><![CDATA[
+def get_daemon_setting(key: str, default: str = "") -> str:
+    # new feature method here
+    ]]></replace>
+  </patch>
+  <patch>
+    <target>tests/test_predictive.py</target>
+    <search><![CDATA[]]></search>
+    <replace><![CDATA[
+import unittest
+# new test contents here
+    ]]></replace>
+  </patch>
+</patches>
 """
 
     response_text, provider = query_llm_cascade(prompt)
@@ -536,32 +585,17 @@ Output your response strictly as a JSON object of this format (do not include ma
 
     log_info(f"LLM cascade response received from {provider}.")
 
-    cleaned = response_text.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
-    cleaned = re.sub(r'"""', '"', cleaned)
-    cleaned = re.sub(r"'''", '"', cleaned)
-
-    try:
-        patch_data = json.loads(cleaned, strict=False)
-    except Exception as parse_err:
-        log_error(f"Failed to parse LLM JSON in check_features_pipeline: {parse_err}")
+    patches = parse_xml_patches(response_text)
+    if not patches:
+        log_error("No valid XML patches could be parsed.")
         with open(INSTALL_DIR / "jan_raw_response.txt", "w") as rf:
             rf.write(response_text)
-        raise parse_err
+        features[pending_idx]["status"] = "failed"
+        with open(FEATURES_JSON, "w") as f:
+            json.dump(data, f, indent=2)
+        return False
 
     try:
-        patches = patch_data.get("patches", [])
-        if not patches:
-            log_error("No patches found in LLM response.")
-            features[pending_idx]["status"] = "failed"
-            with open(FEATURES_JSON, "w") as f:
-                json.dump(data, f, indent=2)
-            return False
-
         # Apply patches atomically
         applied_count = 0
         for p in patches:
