@@ -2597,7 +2597,18 @@ class HealingOrchestrator:
                         cwd_dir = None
                         if target:
                             t_path = Path(target)
-                            cwd_dir = str(t_path.parent) if t_path.is_file() else str(t_path)
+                            if t_path.exists():
+                                cwd_dir = str(t_path) if t_path.is_dir() else str(t_path.parent)
+                        
+                        # Fallback for docker compose commands: use compose file parent dir
+                        if not cwd_dir and ("docker compose" in payload or "docker-compose" in payload):
+                            for svc in self.manifest.services:
+                                if svc.get("name") == service_name or svc.get("container_name") == service_name:
+                                    cf = svc.get("compose_file")
+                                    if cf and os.path.exists(cf):
+                                        cwd_dir = str(Path(cf).parent)
+                                        logger.info("[SHELL-CWD] Resolved compose directory for %s: %s", service_name, cwd_dir)
+                                        break
                         
                         result = subprocess.run(cmd_args, cwd=cwd_dir, capture_output=True, text=True, timeout=60)
                         if result.returncode == 0:
