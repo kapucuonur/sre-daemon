@@ -1,0 +1,11 @@
+[Unit]
+Description=Jan Developer Agent for SRE Self-Evolution
+After=network.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/sre
+ExecStart=/home/pi/sre/venv/bin/python3 /home/pi/sre/jan_developer.py
+StandardOutput=journal
+StandardError=journal

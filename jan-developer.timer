@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Jan Developer Agent periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
