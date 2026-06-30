@@ -270,6 +270,80 @@ def extract_relevant_context(error_context, source_code):
         
     return "\n".join(extracted_sections)
 
+def self_heal_patch_indentation(search_str, replace_str, current_content, target_name):
+    """
+    Attempts to self-heal indentation mismatches between the search block and the target file.
+    If a unique match is found by ignoring leading indentation, re-aligns the patch's indentation.
+    """
+    count = current_content.count(search_str)
+    if count > 0:
+        return search_str, replace_str, count
+
+    # Try matching by stripping leading whitespace on each line
+    search_lines = [l.strip() for l in search_str.splitlines() if l.strip()]
+    if not search_lines:
+        return search_str, replace_str, count
+
+    file_lines = current_content.splitlines()
+    matched_indices = []
+    for idx, f_line in enumerate(file_lines):
+        if f_line.strip() == search_lines[0]:
+            # Verify if subsequent lines match when stripped
+            match_ok = True
+            for s_idx, s_line in enumerate(search_lines):
+                if idx + s_idx >= len(file_lines) or file_lines[idx + s_idx].strip() != s_line:
+                    match_ok = False
+                    break
+            if match_ok:
+                matched_indices.append(idx)
+    
+    if len(matched_indices) == 1:
+        # Found exactly one unique match!
+        start_idx = matched_indices[0]
+        first_line = file_lines[start_idx]
+        actual_indent = len(first_line) - len(first_line.lstrip())
+        
+        # Find the indentation of the first line of LLM's search block
+        llm_first_line = ""
+        for sl in search_str.splitlines():
+            if sl.strip():
+                llm_first_line = sl
+                break
+        
+        if llm_first_line:
+            llm_indent = len(llm_first_line) - len(llm_first_line.lstrip())
+            indent_diff = actual_indent - llm_indent
+            
+            # Re-indent search_str and replace_str by indent_diff
+            new_search_lines = []
+            for sl in search_str.splitlines():
+                if sl.strip():
+                    if indent_diff > 0:
+                        new_search_lines.append(" " * indent_diff + sl)
+                    else:
+                        new_search_lines.append(sl[-indent_diff:])
+                else:
+                    new_search_lines.append(sl)
+            search_str = "\n".join(new_search_lines)
+
+            new_replace_lines = []
+            for rl in replace_str.splitlines():
+                if rl.strip():
+                    if indent_diff > 0:
+                        new_replace_lines.append(" " * indent_diff + rl)
+                    else:
+                        leading = len(rl) - len(rl.lstrip())
+                        strip_len = min(leading, -indent_diff)
+                        new_replace_lines.append(rl[strip_len:])
+                else:
+                    new_replace_lines.append(rl)
+            replace_str = "\n".join(new_replace_lines)
+            
+            log_info(f"Self-healed patch indentation for {target_name} (indent diff: {indent_diff}).")
+            count = current_content.count(search_str)
+
+    return search_str, replace_str, count
+
 def analyze_and_patch(error_context, failed_history=None):
     """Asks the LLM to write a patch for sre_daemon.py based on the failure context."""
     log_info("Starting self-evolution analysis...")
@@ -348,7 +422,7 @@ def get_daemon_setting(key: str, default: str = "") -> str:
                 continue
 
             current_content = sre_daemon_path.read_text(encoding="utf-8")
-            count = current_content.count(search_str)
+            search_str, replace_str, count = self_heal_patch_indentation(search_str, replace_str, current_content, "sre_daemon.py")
             if count == 0:
                 log_error(f"Search block not found in file:\n{search_str[:150]}")
                 continue
@@ -615,7 +689,7 @@ import unittest
                 continue
 
             current_content = target_path.read_text(encoding="utf-8")
-            count = current_content.count(search_str)
+            search_str, replace_str, count = self_heal_patch_indentation(search_str, replace_str, current_content, target_rel)
             if count == 0:
                 log_error(f"Search block not found in file {target_rel}:\n{search_str[:150]}")
                 continue
