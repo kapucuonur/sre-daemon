@@ -282,6 +282,13 @@ Output your response strictly as a JSON object of this format (do not include ma
 
     try:
         patch_data = json.loads(cleaned, strict=False)
+    except Exception as parse_err:
+        log_error(f"Failed to parse LLM JSON in analyze_and_patch: {parse_err}")
+        with open(INSTALL_DIR / "jan_raw_response.txt", "w") as rf:
+            rf.write(response_text)
+        raise parse_err
+
+    try:
         patches = patch_data.get("patches", [])
         if not patches:
             log_error("No patches found in LLM response.")
@@ -536,6 +543,13 @@ Output your response strictly as a JSON object of this format (do not include ma
 
     try:
         patch_data = json.loads(cleaned, strict=False)
+    except Exception as parse_err:
+        log_error(f"Failed to parse LLM JSON in check_features_pipeline: {parse_err}")
+        with open(INSTALL_DIR / "jan_raw_response.txt", "w") as rf:
+            rf.write(response_text)
+        raise parse_err
+
+    try:
         patches = patch_data.get("patches", [])
         if not patches:
             log_error("No patches found in LLM response.")
