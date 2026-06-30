@@ -30,3 +30,4 @@ sre.db
 *.bak*
 *_patched.py
 *_bak/
+manifest.yaml
