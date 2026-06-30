@@ -27,3 +27,6 @@ daemon.log
 .DS_Store
 Thumbs.db
 sre.db
+*.bak*
+*_patched.py
+*_bak/

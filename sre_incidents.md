@@ -1482,3 +1482,262 @@
 - **Timestamp**: 2026-06-29T13:11:20.767884+00:00
 - **Proposed Command**: `docker compose up -d --build bikefit-api`
 - **Success**: True
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T16:18:30.823255+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "__DETECTED_BY_SRE__", "search": "raise Exception('Container crashed')", "replace": "try:\n    # kod buraya\nexcept Exception as e:\n    logging.error(f'Container crashed: {e}')"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T16:18:50.470125+00:00
+- **Proposed Command**: `systemctl restart sre-daemon.service`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T16:24:36.699075+00:00
+- **Proposed Command**: `docker restart ai-sre-platform`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T16:24:38.081215+00:00
+- **Proposed Command**: `[{"type": "append", "target": "requirements.txt", "payload": "docker"}, {"type": "replace", "target": "__DETECTED_BY_SRE__", "search": "docker-compose up", "replace": "docker-compose up -d --build"}, {"type": "shell", "target": "/home/pi", "payload": "docker restart ai-sre-platform"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T16:52:28.466603+00:00
+- **Proposed Command**: `[{"type": "append", "target": "requirements.txt", "payload": "typing"}]`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:16:58.740740+00:00
+- **Proposed Command**: `docker compose restart bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:17:04.250034+00:00
+- **Proposed Command**: ``
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:17:06.159302+00:00
+- **Proposed Command**: `docker compose restart bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:17:07.839165+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:17:13.106443+00:00
+- **Proposed Command**: `docker compose restart bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:17:14.727026+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:17:18.339768+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:17:20.526660+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:17:22.192549+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:17:22.519240+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:17:25.457194+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:25:48.730541+00:00
+- **Proposed Command**: `[{"type": "append", "target": "requirements.txt", "payload": "docker"}]`
+- **Success**: True
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:34:38.418718+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\n    if not results or len(results[0].boxes) == 0:\n        raise HTTPException(status_code=422, detail=\"YOLO failed\")"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:36:10.405092+00:00
+- **Proposed Command**: `docker compose restart bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:36:12.091101+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:41:45.446276+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\nif not results or len(results[0].boxes) == 0:\n    raise HTTPException(status_code=422, detail=\"YOLO failed\")"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:44:05.084942+00:00
+- **Proposed Command**: ``
+- **Success**: True
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:50:01.476492+00:00
+- **Proposed Command**: `[{"type": "append", "target": "requirements.txt", "payload": "docker"}, {"type": "shell", "target": "/home/pi", "payload": "docker restart ai-sre-platform"}]`
+- **Success**: True
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T17:50:32.299180+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\nif not results or len(results[0].boxes) == 0:\n    raise HTTPException(status_code=422, detail=\"YOLO failed\")"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T17:57:59.001658+00:00
+- **Proposed Command**: ``
+- **Success**: True
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T18:01:30.362096+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\n    if not results or len(results[0].boxes) == 0:\n        raise HTTPException(status_code=422, detail=\"YOLO failed\")"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T18:04:20.159158+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T18:04:28.939701+00:00
+- **Proposed Command**: `docker compose restart bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T18:04:31.735463+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T18:04:32.060126+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T18:04:46.825842+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T18:10:02.847095+00:00
+- **Proposed Command**: ``
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T18:12:50.526648+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\n    if not results or len(results[0].boxes) == 0:\n        raise HTTPException(status_code=422, detail=\"YOLO failed\")"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T18:19:59.441012+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\n    if not results or len(results[0].boxes) == 0:\n        raise HTTPException(status_code=422, detail=\"YOLO failed\")"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T18:22:05.480631+00:00
+- **Proposed Command**: `[{"type": "append", "target": "requirements.txt", "payload": "stripe"}]`
+- **Success**: True
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: failed
+- **Timestamp**: 2026-06-29T18:22:15.860228+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\nif not results or len(results[0].boxes) == 0:\n    raise HTTPException(status_code=422, detail=\"YOLO failed\")"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [SRE-Platform]
+- **Service**: [SRE-Platform]
+- **Status**: resolved
+- **Timestamp**: 2026-06-29T18:24:07.382493+00:00
+- **Proposed Command**: ``
+- **Success**: True

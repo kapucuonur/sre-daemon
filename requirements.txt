@@ -6,3 +6,5 @@ docker
 uvicorn
 typing
 docker
+docker
+stripe

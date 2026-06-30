@@ -70,7 +70,7 @@ MANIFEST_PATH     = INSTALL_DIR / "manifest.yaml"
 SELF_PATH         = Path(__file__).resolve()
 HEAL_LOG          = os.getenv("HEAL_LOG", str(INSTALL_DIR / "heal_log.jsonl"))
 MAX_LOCAL_TRIES   = 3
-OLLAMA_TIMEOUT    = 180
+OLLAMA_TIMEOUT    = 60  # Reduced: if local model is slow, fall through to cloud
 ANTHROPIC_TIMEOUT = 60
 RATE_LIMIT_SECONDS = 600
 
@@ -655,6 +655,24 @@ def save_heal_history(
     except Exception as e:
         logger.error("heal_history kayıt hatası: %s", str(e))
 
+def get_analyst_insight(project_tag: str) -> str:
+    """AI Log Analyst'ın son tespitini DB'den oku ve prompt'a ekle."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("""
+                SELECT report FROM analyst_insights
+                WHERE consumed = 0
+                AND created_at > datetime('now', '-2 hours')
+                ORDER BY created_at DESC LIMIT 1
+            """).fetchone()
+            if row:
+                conn.execute("UPDATE analyst_insights SET consumed = 1 WHERE consumed = 0")
+                conn.commit()
+                return f"\n\n[AI Log Analyst Insight]\n{row[0][:800]}"
+    except Exception:
+        pass
+    return ""
+
 def get_heal_history_for_hash(error_hash: str, limit: int = 10) -> list:
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -1180,12 +1198,17 @@ class GeminiClient:
                 ]
             }
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                logger.warning("Gemini rate limited. Cooling down %ds.", retry_after)
+                time.sleep(min(retry_after, 60))
+                return None
             resp.raise_for_status()
             res_json = resp.json()
             text = res_json["candidates"][0]["content"]["parts"][0]["text"]
             return text.strip()
         except Exception as e:
-            logger.error("Gemini API hatası: %s", str(e))
+            logger.error("Gemini API error: %s", str(e))
         return None
 
 class GroqClient:
@@ -1206,12 +1229,17 @@ class GroqClient:
                 "temperature": 0.2
             }
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                logger.warning("Groq rate limited. Cooling down %ds.", retry_after)
+                time.sleep(min(retry_after, 60))
+                return None
             resp.raise_for_status()
             res_json = resp.json()
             text = res_json["choices"][0]["message"]["content"]
             return text.strip()
         except Exception as e:
-            logger.error("Groq API hatası: %s", str(e))
+            logger.error("Groq API error: %s", str(e))
         return None
 
 class XAIClient:
@@ -1225,19 +1253,28 @@ class XAIClient:
                 "Content-Type": "application/json"
             }
             payload = {
-                "model": "grok-2-1212",
+                "model": "grok-3-mini",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.2
+                "temperature": 0.2,
+                "max_tokens": 2048
             }
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                logger.warning("xAI rate limited. Cooling down %ds.", retry_after)
+                time.sleep(min(retry_after, 60))
+                return None
+            if resp.status_code == 400:
+                logger.error("xAI 400 Bad Request: %s", resp.text[:200])
+                return None
             resp.raise_for_status()
             res_json = resp.json()
             text = res_json["choices"][0]["message"]["content"]
             return text.strip()
         except Exception as e:
-            logger.error("xAI/Grok API hatası: %s", str(e))
+            logger.error("xAI/Grok API error: %s", str(e))
         return None
 
 class AnthropicClient:
@@ -1611,7 +1648,6 @@ class HealingOrchestrator:
             f"\nCurrent service: {project_name}\n"
             "Services registered in manifest.yaml:\n"
             f"{services_ctx}\n\n"
-            "IMPORTANT: Set target=\"__DETECTED_BY_SRE__\" in replace/write actions. "
             "The daemon resolves the real host path automatically from the traceback.\n"
             f"{past_context}\n"
             "Analyze the following error and respond with the minimal surgical fix:\n"
@@ -1622,12 +1658,11 @@ class HealingOrchestrator:
             "- 'append': Add a new line to a file (e.g., target='requirements.txt', payload='slowapi')\n"
             "- 'write': Overwrite a file with new content.\n"
             "- 'replace': Bir dosyada belirli bir kod bloğunu yeni kod bloğuyla değiştirmek için.\n"
-            "- 'replace': Bir dosyada belirli bir kod bloğunu yeni kod bloğuyla değiştirmek için.\n"
-            "  Format: {\"type\": \"replace\", \"target\": \"__DETECTED_BY_SRE__\", \"search\": \"old_code\", \"replace\": \"new_code\"}\n"
             "- 'shell': Güvenli bir komut çalıştırmak için (örn: target='/home/pi/bikefit', payload='docker compose up -d --build bikefit-api').\n"
             "  NOT: Shell komutları yalnızca docker compose, docker restart veya systemctl restart/start komutları olmalıdır. Güvenli olmayan veya izin verilmeyen hiçbir komut çalıştırma!\n\n"
             f"{context_section}"
             f"HATA:\n{tagged_line[:1500]}\n\n"
+            f"{get_analyst_insight(project_tag)}"
             "JSON formatında yanıt ver. Yanıtın mutlaka geçerli bir JSON olmalıdır ve kod blokları içermemelidir. Örnek şema:\n"
             "{\n"
             '  "root_cause": "Kök neden açıklaması",\n'
@@ -1795,7 +1830,6 @@ class HealingOrchestrator:
                             f"{raw_code}\n"
                             "```\n"
                             "Analyze the code context above. Identify the error line and generate a 'replace' action.\n"
-                            "Set target=\"__DETECTED_BY_SRE__\" — the daemon will resolve the real path automatically.\n\n"
                         )
                         skip_local_pi = True   # large prompt — skip slow Pi Ollama
                 else:
@@ -1881,21 +1915,16 @@ class HealingOrchestrator:
                 actions = data.get("actions", [])
 
                 # ── LAYER 3: Deterministic target override ────────────────────
-                # LLM sets target="__DETECTED_BY_SRE__" — daemon resolves real path
                 if detected_target_file:
                     for act in actions:
                         if act.get("type") in ("replace", "write", "append"):
-                            t = act.get("target", "")
-                            if t == "__DETECTED_BY_SRE__" or not t or not os.path.exists(t):
-                                act["target"] = detected_target_file
-                                logger.info("[LAYER3] target override → %s", detected_target_file)
+                            act["target"] = detected_target_file
+                            logger.info("[LAYER3] target override → %s", detected_target_file)
                 else:
-                    # If target is __DETECTED_BY_SRE__ but traceback wasn't resolved, drop those code patch actions
                     filtered_actions = []
                     for act in actions:
                         t = act.get("target", "")
-                        if act.get("type") in ("replace", "write", "append") and t == "__DETECTED_BY_SRE__":
-                            logger.warning("[HEAL] Dropped action targeting __DETECTED_BY_SRE__ because no traceback file was resolved: %s", act)
+                        if not t:
                             continue
                         filtered_actions.append(act)
                     actions = filtered_actions
@@ -1941,6 +1970,52 @@ class HealingOrchestrator:
                             f"Bekçi köpeği geri yükleme yaptı\\!\n"
                             f"Hata: `{fail_summary}`"
                         )
+
+                        # ── FAILURE ANALYSIS: Learn from failure ──────────────────────
+                        try:
+                            failure_prompt = (
+                                f"You are an SRE AI. A previous fix attempt FAILED for this error:\n"
+                                f"ERROR: {tagged_line[:800]}\n\n"
+                                f"FAILED ACTIONS: {json.dumps(failed, ensure_ascii=False)[:400]}\n\n"
+                                f"Analyze why the fix failed and suggest a DIFFERENT remediation strategy. "
+                                f"Do NOT repeat the same actions. Focus on alternative approaches.\n"
+                                f"Respond ONLY in JSON: {{\"root_cause\": \"why it failed\", \"actions\": [...]}}\n"
+                                f"Only safe actions: docker compose up/restart, systemctl restart/start."
+                            )
+                            retry_result = None
+                            retry_source = None
+                            # Try local Ollama first (free)
+                            retry_result = self.ollama.query(PI_OLLAMA_URL, "qwen2.5-coder:7b", failure_prompt)
+                            retry_source = "pi-ollama/failure-analysis"
+                            if not retry_result and GROQ_API_KEY:
+                                retry_result = self.groq.query(failure_prompt)
+                                retry_source = "groq/failure-analysis"
+                            if not retry_result and GEMINI_API_KEY:
+                                retry_result = self.gemini.query(failure_prompt)
+                                retry_source = "gemini/failure-analysis"
+
+                            if retry_result:
+                                cleaned = retry_result.strip().replace("```json", "").replace("```", "").strip()
+                                retry_parsed = json.loads(cleaned)
+                                retry_actions = retry_parsed.get("actions", [])
+                                if retry_actions:
+                                    logger.info("[FAILURE-ANALYSIS] Alternative strategy found via %s: %s", retry_source, retry_actions)
+                                    retry_executed = self.execute_approved_actions(retry_actions, 0)
+                                    retry_ok = all(e.get("status") == "success" for e in retry_executed)
+                                    register_actions_in_registry(DB_PATH, _error_hash, retry_actions, success=retry_ok)
+                                    if retry_ok:
+                                        send_telegram_text(
+                                            TELEGRAM_CHAT_ID,
+                                            f"🔄 *SRE Failure Analysis — Alternatif Fix Başarılı*\n"
+                                            f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                                            f"🤖 *Kaynak*: `{md_escape(retry_source)}`\n"
+                                            f"Sistem alternatif stratejiyle stabilize edildi\."
+                                        )
+                                    else:
+                                        logger.warning("[FAILURE-ANALYSIS] Alternative fix also failed. Giving up.")
+                        except Exception as fa_err:
+                            logger.error("[FAILURE-ANALYSIS] Error during failure analysis: %s", fa_err)
+                        # ── FAILURE ANALYSIS SONU ────────────────────────────────────
 
                     save_heal_history(
                         error_hash=err_hash,
@@ -2249,44 +2324,69 @@ class HealingOrchestrator:
                             
                             # ── 3. Ambiguous Replace Resolver (Layer B) ──
                             if count > 1:
-                                logger.info("[REPLACE RESOLVER] Replace belirsiz: %d eşleşme bulundu. LLM'den benzersiz context istenir...", count)
-                                resolver_prompt = (
-                                    "You are an expert developer. A search-and-replace block matched multiple locations in the file.\n"
-                                    f"Target File: {target}\n"
-                                    f"Original Search Block:\n```\n{search_str}\n```\n"
-                                    f"Original Replace Block:\n```\n{replace_str}\n```\n"
-                                    "Please read the target file contents, and provide an EXPANDED search block that matches "
-                                    "EXACTLY ONE unique location in the target file, along with the corresponding replace block.\n\n"
-                                    "Format your response as a JSON object containing:\n"
-                                    "{\n"
-                                    '  "search": "expanded search string with unique surrounding context",\n'
-                                    '  "replace": "expanded replacement string matching the search string"\n'
-                                    "}\n"
-                                    "Return ONLY the JSON block. Do not include any explanations."
-                                )
-                                res, source = self.query_llm_cascade(resolver_prompt, tenant_id, skip_local_pi=True)
-                                if res:
+                                line_hint = act.get("line_hint")
+                                resolved_via_hint = False
+                                if line_hint:
                                     try:
-                                        cleaned_res = res.strip()
-                                        if cleaned_res.startswith("```json"):
-                                            cleaned_res = cleaned_res[7:]
-                                        if cleaned_res.endswith("```"):
-                                            cleaned_res = cleaned_res[:-3]
-                                        resolver_data = json.loads(cleaned_res.strip())
-                                        expanded_search = resolver_data.get("search", "")
-                                        expanded_replace = resolver_data.get("replace", "")
-                                        if expanded_search:
-                                            search_str = expanded_search
-                                            replace_str = expanded_replace
-                                            count = orig_content.count(search_str)
-                                            logger.info("[REPLACE RESOLVER] Benzersiz search bloğu bulundu via %s (count=%d)", source, count)
-                                    except Exception as res_ex:
-                                        logger.warning("[REPLACE RESOLVER] LLM yanıtı parse edilemedi: %s", res_ex)
-                                
-                                if count > 1:
-                                    raise ValueError(f"Replace belirsiz: {count} eşleşme bulundu")
+                                        lines = orig_content.splitlines(keepends=True)
+                                        target_line = int(line_hint) - 1
+                                        best_pos = None
+                                        best_dist = float('inf')
+                                        pos = 0
+                                        for i, line in enumerate(lines):
+                                            if search_str in line:
+                                                dist = abs(i - target_line)
+                                                if dist < best_dist:
+                                                    best_dist = dist
+                                                    best_pos = orig_content.index(search_str, pos)
+                                            pos += len(line)
+                                        if best_pos is not None:
+                                            new_content = orig_content[:best_pos] + replace_str + orig_content[best_pos + len(search_str):]
+                                            resolved_via_hint = True
+                                            logger.info("[REPLACE RESOLVER] Resolved via line_hint=%s", line_hint)
+                                    except Exception as hint_ex:
+                                        logger.warning("[REPLACE RESOLVER] line_hint resolution failed: %s", hint_ex)
+
+                                if not resolved_via_hint:
+                                    logger.info("[REPLACE RESOLVER] Replace belirsiz: %d eşleşme bulundu. LLM'den benzersiz context istenir...", count)
+                                    resolver_prompt = (
+                                        "You are an expert developer. A search-and-replace block matched multiple locations in the file.\n"
+                                        f"Target File: {target}\n"
+                                        f"Original Search Block:\n```\n{search_str}\n```\n"
+                                        f"Original Replace Block:\n```\n{replace_str}\n```\n"
+                                        "Please read the target file contents, and provide an EXPANDED search block that matches "
+                                        "EXACTLY ONE unique location in the target file, along with the corresponding replace block.\n\n"
+                                        "Format your response as a JSON object containing:\n"
+                                        "{\n"
+                                        '  "search": "expanded search string with unique surrounding context",\n'
+                                        '  "replace": "expanded replacement string matching the search string"\n'
+                                        "}\n"
+                                        "Return ONLY the JSON block. Do not include any explanations."
+                                    )
+                                    res, source = self.query_llm_cascade(resolver_prompt, tenant_id, skip_local_pi=True)
+                                    if res:
+                                        try:
+                                            cleaned_res = res.strip()
+                                            if cleaned_res.startswith("```json"):
+                                                cleaned_res = cleaned_res[7:]
+                                            if cleaned_res.endswith("```"):
+                                                cleaned_res = cleaned_res[:-3]
+                                            resolver_data = json.loads(cleaned_res.strip())
+                                            expanded_search = resolver_data.get("search", "")
+                                            expanded_replace = resolver_data.get("replace", "")
+                                            if expanded_search:
+                                                search_str = expanded_search
+                                                replace_str = expanded_replace
+                                                count = orig_content.count(search_str)
+                                                logger.info("[REPLACE RESOLVER] Benzersiz search bloğu bulundu via %s (count=%d)", source, count)
+                                        except Exception as res_ex:
+                                            logger.warning("[REPLACE RESOLVER] LLM yanıtı parse edilemedi: %s", res_ex)
                                     
-                            new_content = orig_content.replace(search_str, replace_str, 1)
+                                    if count > 1:
+                                        raise ValueError(f"Replace belirsiz: {count} eşleşme bulundu ve line_hint yok/çözülemedi")
+                                    new_content = orig_content.replace(search_str, replace_str, 1)
+                            else:
+                                new_content = orig_content.replace(search_str, replace_str, 1)
 
                         with open(tmp_path, "w", encoding="utf-8") as f:
                             f.write(new_content)
