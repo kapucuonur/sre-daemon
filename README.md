@@ -1,7 +1,7 @@
 # 🤖 SRE Daemon
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-31%20passed-4ade80?style=flat-square" alt="tests" />
+  <img src="https://img.shields.io/badge/tests-38%20passed-4ade80?style=flat-square" alt="tests" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20VPS%20%7C%20Pi%205-6366f1?style=flat-square" alt="Platform" />
   <img src="https://img.shields.io/badge/Ollama-Local%20First-FC7E0F.svg?style=flat-square" alt="Ollama" />
   <img src="https://img.shields.io/badge/Groq-Llama%203.3-f55036.svg?style=flat-square" alt="Groq Llama 3.3" />
@@ -75,12 +75,13 @@ Any Linux Server (Pi 5, Ubuntu VPS, Debian, RHEL, ...)
       ├── Independent Watchdog & Heartbeat
       ├── Dynamic Whitelist Learning Engine (learned_patterns.json)
       │
-      └── 5-Tier Hierarchical LLM Fallback Stack
-            ├── 1. MacBook Ollama (Network) --> qwen2.5-coder:32b (Heavy Local / Free)
-            ├── 2. Local Ollama (Fast)       --> qwen2.5-coder:7b  (Offline / Free)
+      └── 6-Tier Hierarchical LLM Fallback Stack
+            ├── 1. MacBook Ollama (Network)  --> qwen2.5-coder:32b (Heavy Local / Free)
+            ├── 2. Google Gemini API         --> gemini-2.5-flash (Cloud / Free)
             ├── 3. Groq Cloud API            --> llama-3.3-70b-versatile (Fast / Free)
-            ├── 4. Google Gemini API         --> gemini-2.5-flash (Cloud / Free)
-            └── 5. Anthropic Claude API      --> claude-sonnet-4-6 (Last Resort / Expensive)
+            ├── 4. Grok (xAI) API            --> grok-2-1212 (Cloud / Budgeted)
+            ├── 5. Local Pi Ollama (Offline)  --> qwen2.5-coder:7b (Local Fallback)
+            └── 6. Anthropic Claude API      --> claude-sonnet-4-6 (Last Resort / Expensive)
 ```
 
 ---
