@@ -374,6 +374,51 @@ Output your response strictly as a JSON object of this format (do not include ma
             pass
         return False
 
+def extract_feature_context(source_code, feature_title, feature_desc):
+    """
+    Scans the source code for class/method definitions matching keywords
+    derived from the feature request and extracts their full bodies.
+    """
+    lines = source_code.splitlines()
+    skeleton = []
+    # 1. Build outline
+    for idx, line in enumerate(lines):
+        if line.startswith("class ") or line.startswith("def ") or (line.startswith("    def ") and not line.strip().startswith("def __")):
+            skeleton.append(f"Line {idx+1}: {line}")
+
+    # 2. Derive keywords from title and desc
+    all_words = re.findall(r'\b[a-zA-Z]{4,}\b', f"{feature_title} {feature_desc}")
+    keywords = list(set([w.lower() for w in all_words]))
+    
+    # Common SRE terms that are highly useful
+    sre_terms = ["metric", "collector", "stats", "anomaly", "check", "alarm", "predict", "rebuild", "database"]
+    keywords.extend(sre_terms)
+    keywords = list(set(keywords))
+
+    extracted_blocks = []
+    # 3. Extract blocks matching keywords
+    for keyword in keywords:
+        for idx, line in enumerate(lines):
+            # If function or class definition matches keyword
+            if (line.startswith("class ") or "def " in line) and keyword in line.lower():
+                start = idx
+                indent = len(line) - len(line.lstrip())
+                end = idx + 1
+                while end < len(lines):
+                    next_line = lines[end]
+                    if next_line.strip():
+                        next_indent = len(next_line) - len(next_line.lstrip())
+                        if next_indent <= indent and not next_line.strip().startswith("#"):
+                            break
+                    end += 1
+                segment = "\n".join(lines[start:end])
+                block_title = f"--- Definition matching '{keyword}' near line {start+1} ---"
+                # Avoid duplicate extractions of the exact same block
+                if not any(block_title in b for b in extracted_blocks):
+                    extracted_blocks.append(f"{block_title}\n{segment}\n")
+
+    return "--- CODE SKELETON ---\n" + "\n".join(skeleton[:100]) + "\n\n" + "\n".join(extracted_blocks[:15])
+
 FEATURES_JSON = INSTALL_DIR / "features.json"
 
 def check_features_pipeline():
@@ -392,7 +437,8 @@ def check_features_pipeline():
     pending_feature = None
     pending_idx = -1
     for idx, feat in enumerate(features):
-        if feat.get("status") == "pending":
+        if feat.get("status") == "pending" or feat.get("status") == "failed":
+            # Allow retrying failed features
             pending_feature = feat
             pending_idx = idx
             break
@@ -431,19 +477,24 @@ def check_features_pipeline():
     with open(sre_daemon_path, "r", encoding="utf-8") as f:
         source_code = f.read()
 
+    code_context = extract_feature_context(source_code, title, desc)
+
     # Formulate prompt for new features
     prompt = f"""You are Jan, the self-evolving AI SRE developer agent.
-Your primary task is to implement a new feature in 'sre_daemon.py' and its corresponding tests based on the feature request below.
+Your primary task is to implement a new feature in 'sre_daemon.py' and its corresponding tests based on the feature request and the code context below.
 
 [FEATURE REQUEST]
 ID: {feat_id}
 Title: {title}
 Description: {desc}
 
+[CODE CONTEXT SKELETON AND MATCHING METHODS IN SRE_DAEMON.PY]
+{code_context}
+
 You must write clean, correct, and robust code for the feature.
-You must also include tests to verify the new feature.
-Generate a JSON output listing the patches to apply to the files. Each patch block targets a file, specifies a 'search' block to replace, and a 'replace' block.
-If you need to create a completely new file (like a new test file under 'tests/'), set 'search' to an empty string ("") or omit it, and set the target path and 'replace' content.
+If you need to add a new method to a class (e.g. SREDaemon or MetricsCollector), find a suitable method definition in the code context, and write a search/replace block replacing that definition with the definition + your new method!
+Make sure your search block matches the code context EXACTLY (including line indentation). Do not include line numbers in the search or replace blocks.
+You must also write a corresponding unit test to verify the new feature works. If you create a new test file (e.g. 'tests/test_predictive.py'), set 'search': "" and target: "tests/test_predictive.py" and put the complete content of the file in 'replace'.
 
 Output your response strictly as a JSON object of this format (do not include markdown wrapper blocks or explanations):
 {{
