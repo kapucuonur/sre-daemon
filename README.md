@@ -162,10 +162,14 @@ An independent background log monitor (`ai_log_analyst.py`) runs periodically vi
 | **Service Auto-Discovery** | Uses `docker inspect` at runtime to resolve container paths to host paths. Zero hardcoded directories. |
 | **Multi-Runtime Rebuild** | After a successful patch, automatically rebuilds the affected service: docker-compose, systemd, PM2, Kubernetes, or bare process. |
 | **Language-Agnostic Validator** | Sandboxes patches with the correct tool per language: `.py` → `py_compile`, `.js` → `node --check`, `.rb` → `ruby -c`, `.sh` → `bash -n`, and more. |
+| **RAG Indexer & AST Validation** | Intelligently retrieves relevant source code via RAG, validates ASTs, and executes **1-shot self-repair** on semantic issues (e.g. `pyflakes` validation loop). |
 | **Visual Git Diffs** | Computes and displays interactive code changes as unified diff in Telegram notifications. |
 | **5-Tier LLM Pipeline** | Hierarchical fallback from local Ollama → Groq → Gemini → Claude to minimize API costs. |
 | **Strategy Registry** | Learns successful healing commands and replicates them instantly without LLM calls. Weight Decay algorithm included. |
 | **Dynamic Whitelist Learning** | Self-learning execution security layer that generates regex patterns for approved commands. |
+| **Predictive Scaling Advisor** | Includes circuit breaker tracking, active canary metrics, and exponential moving averages to prevent anomalous outages proactively. |
+| **Independent Jan Developer Agent** | Configured as an isolated systemd unit (`jan-developer.timer`), orchestrating autonomous development tasks completely independent from the core SRE Daemon. |
+| **Generic SaaS Engine** | Powered by `config.json` and auto-discovery, allowing simple scaling from single-tenant to multi-tenant operations. |
 | **ChatOps Integration** | Full Telegram buttons and Slack interactive action handlers for remote infrastructure administration. |
 | **SQLite HITL State Store** | Persistently tracks pending approvals, surviving crashes and service restarts. |
 | **Budget Auto-Reset** | Daily API usage counters reset automatically at midnight UTC. |

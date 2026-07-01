@@ -1,7 +1,0 @@
-[
-  "^docker compose (up|restart)( -d)?( --build)?$",
-  "^docker compose (up|restart)( -d)?( --build)? [a-zA-Z0-9_-]+$",
-  "^docker compose (up|restart)( -d)?( --build)?( [a-zA-Z0-9_-]+)?$",
-  "^docker compose down$",
-  "^docker restart [a-zA-Z0-9_-]+$"
-]

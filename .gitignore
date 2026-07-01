@@ -31,3 +31,9 @@ sre.db
 *_patched.py
 *_bak/
 manifest.yaml
+
+# Ignored DBs and Runtime State
+*.db
+features.json
+learned_patterns.json
+0.05
