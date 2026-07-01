@@ -8,3 +8,5 @@ typing
 docker
 docker
 stripe
+uvicorn[standard]
+uvicorn

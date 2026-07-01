@@ -1748,3 +1748,66 @@
 - **Timestamp**: 2026-06-30T10:29:26.828043+00:00
 - **Proposed Command**: `systemctl restart sre-daemon.service`
 - **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-30T21:09:08.826637+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-30T21:09:16.947784+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-30T21:10:13.713030+00:00
+- **Proposed Command**: `[{"type": "append", "target": "requirements.txt", "payload": "uvicorn[standard]"}, {"type": "shell", "target": "/home/pi/bikefit", "payload": "docker compose up -d --build bikefit-api"}]`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-30T21:10:15.454818+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-30T21:10:19.534733+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-30T21:10:19.938031+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-30T21:11:20.291828+00:00
+- **Proposed Command**: `docker compose up -d --build bikefit-api`
+- **Success**: False
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: resolved
+- **Timestamp**: 2026-06-30T21:11:22.103996+00:00
+- **Proposed Command**: `[{"type": "append", "target": "requirements.txt", "payload": "uvicorn"}, {"type": "shell", "target": "/home/pi/bikefit", "payload": "docker compose up -d --build bikefit-api"}]`
+- **Success**: True
+
+## Incident: Autonomous Healing: [BikeFit-API]
+- **Service**: [BikeFit-API]
+- **Status**: failed
+- **Timestamp**: 2026-06-30T21:13:56.287117+00:00
+- **Proposed Command**: `[{"type": "replace", "target": "/home/pi/bikefit/pi_main.py", "search": "results = model(frame, verbose=False)", "replace": "results = model(frame, verbose=False)\n    if not results or len(results[0].boxes) == 0:\n        raise HTTPException(status_code=422, detail=\"YOLO failed\")"}, {"type": "shell", "target": "/home/pi/bikefit", "payload": "docker compose up -d --build bikefit-api"}]`
+- **Success**: False
