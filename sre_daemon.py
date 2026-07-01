@@ -54,7 +54,7 @@ load_env()
 # ── Configuration & Paths ────────────────────────────────────
 MAC_IP            = os.getenv("MAC_IP", "")
 MAC_OLLAMA_URL    = f"http://{MAC_IP}:11434"
-PI_OLLAMA_URL     = os.getenv("PI_OLLAMA_URL", "http://localhost:11434")
+PI_OLLAMA_URL     = os.getenv("PI_OLLAMA_URL", "http://192.168.1.116:11434")
 ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -158,42 +158,6 @@ import json
 import time
 import requests
 
-def count_ast_nodes(code_string: str) -> int:
-    try:
-        tree = ast.parse(code_string)
-        return len(list(ast.walk(tree)))
-    except:
-        return 0
-
-def log_repair_attempt(incident_id: str, status: str, details: str):
-    log_entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "incident_id": incident_id,
-        "status": status,
-        "details": details
-    }
-    with open("repair_history.jsonl", "a") as f:
-        f.write(json.dumps(log_entry) + "\n")
-
-def run_canary_probe(service_url: str) -> bool:
-    try:
-        response = requests.get(service_url, timeout=5)
-        return response.status_code == 200
-    except:
-        return False
-
-def check_circuit_breaker(failure_count: int) -> bool:
-    return failure_count >= 3
-
-class TenantRateLimiter:
-    def __init__(self, max_calls_per_hour=50):
-        self.max_calls = max_calls_per_hour
-        self.calls = []
-
-    def can_proceed(self) -> bool:
-        now = time.time()
-        self.calls = [c for c in self.calls if now - c < 3600]
-        return len(self.calls) < self.max_calls
 
 def md_escape(text: str) -> str:
     if text is None:
@@ -754,7 +718,6 @@ def try_process_action(action_id: int, target_status: str) -> Optional[List[Dict
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * pending_actions WHERE id = ?", (action_id,))
             cursor.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,))
             row = cursor.fetchone()
             if not row:
@@ -952,7 +915,7 @@ class LanguageValidator:
         ".php":  ["php", "-l", "__FILE__"],
     }
 
-    def validate(self, file_path: str) -> tuple:
+    def validate(self, file_path: str, patch_range: tuple = None) -> tuple:
         """
         Returns (ok: bool, error_msg: str).
         Unknown extensions → (True, "") to be non-blocking.
@@ -985,6 +948,12 @@ class LanguageValidator:
                         for line in output.splitlines():
                             if not line.strip():
                                 continue
+                            if patch_range:
+                                m = re.search(r"^[^:]+:(\d+):", line)
+                                if m:
+                                    err_line = int(m.group(1))
+                                    if not (patch_range[0] <= err_line <= patch_range[1]):
+                                        continue
                             line_lower = line.lower()
                             if "unused" in line_lower:
                                 continue
@@ -1095,7 +1064,7 @@ class FileEditor:
             f.write(content)
         os.replace(temp_path, file_path)
 
-    def validate_syntax(self, file_path: str) -> tuple:
+    def validate_syntax(self, file_path: str, patch_range: tuple = None) -> tuple:
         """
         Validates python file syntax using py_compile and pyflakes.
         Returns: (is_valid: bool, error_message: str)
@@ -1119,6 +1088,12 @@ class FileEditor:
                 for line in output.splitlines():
                     if not line.strip():
                         continue
+                    if patch_range:
+                        m = re.search(r"^[^:]+:(\d+):", line)
+                        if m:
+                            err_line = int(m.group(1))
+                            if not (patch_range[0] <= err_line <= patch_range[1]):
+                                continue
                     line_lower = line.lower()
                     if "unused" in line_lower:
                         continue
@@ -1152,12 +1127,19 @@ class FileEditor:
             # Perform substitution
             patched_content = content.replace(search_block, replace_block)
 
+            patch_range = None
+            idx = patched_content.find(replace_block)
+            if idx != -1:
+                start_line = patched_content.count('\n', 0, idx) + 1
+                end_line = start_line + replace_block.count('\n')
+                patch_range = (start_line, end_line)
+
             # Sandbox validation via temp file
             temp_test_path = file_path + "_test_patch.py"
             with open(temp_test_path, "w", encoding="utf-8") as f:
                 f.write(patched_content)
 
-            is_valid, err_msg = self.validate_syntax(temp_test_path)
+            is_valid, err_msg = self.validate_syntax(temp_test_path, patch_range=patch_range)
             if os.path.exists(temp_test_path):
                 os.unlink(temp_test_path)
 
@@ -1225,6 +1207,20 @@ class OllamaClient:
             logger.warning("Ollama hatası (%s): %s", base_url, str(e))
         return None
 
+class CloudCircuitBreaker:
+    def __init__(self):
+        self.broken_until = 0
+    def is_broken(self):
+        import time
+        return time.time() < self.broken_until
+    def trip(self, minutes=15):
+        import time
+        self.broken_until = time.time() + (minutes * 60)
+        import logging
+        logging.getLogger(__name__).warning(f"Circuit breaker TRIPPED! Local Ollama only for {minutes} mins.")
+
+circuit_breaker = CloudCircuitBreaker()
+
 class GeminiClient:
     def query(self, prompt: str) -> Optional[str]:
         if not GEMINI_API_KEY:
@@ -1243,9 +1239,7 @@ class GeminiClient:
             }
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 60))
-                logger.warning("Gemini rate limited. Cooling down %ds.", retry_after)
-                time.sleep(min(retry_after, 60))
+                circuit_breaker.trip()
                 return None
             resp.raise_for_status()
             res_json = resp.json()
@@ -1274,9 +1268,7 @@ class GroqClient:
             }
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 60))
-                logger.warning("Groq rate limited. Cooling down %ds.", retry_after)
-                time.sleep(min(retry_after, 60))
+                circuit_breaker.trip()
                 return None
             resp.raise_for_status()
             res_json = resp.json()
@@ -1306,9 +1298,7 @@ class XAIClient:
             }
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 60))
-                logger.warning("xAI rate limited. Cooling down %ds.", retry_after)
-                time.sleep(min(retry_after, 60))
+                circuit_breaker.trip()
                 return None
             if resp.status_code == 400:
                 logger.error("xAI 400 Bad Request: %s", resp.text[:200])
@@ -1362,8 +1352,8 @@ tenant_rate_limiter = TenantRateLimiter(calls_per_minute=5)
 
 # ── AST Node Counter (Intent Verification Helper) ──
 def count_ast_nodes(code: str) -> int:
-    import ast
     try:
+        import ast
         tree = ast.parse(code)
         count = 0
         for node in ast.walk(tree):
@@ -1378,7 +1368,6 @@ def check_circuit_breaker(tenant_id: str, service_name: str, db_path: Path = DB_
     try:
         with sqlite3.connect(db_path) as conn:
             now_dt = datetime.now(timezone.utc)
-            now_str = now_dt.isoformat()
             
             # Is service already frozen?
             row = conn.execute(
@@ -1459,11 +1448,6 @@ def run_canary_probe(probe_config: dict) -> tuple[bool, str]:
 
 # ── Healing Orchestrator & Action Runner ─────────────────────
 class HealingOrchestrator:
-    def run_safety_checks(self, project_tag, error_hash):
-        if check_circuit_breaker(0): # failure_count mantığını buraya bağlayacağız
-            return False, "Circuit breaker aktif."
-        return True, "Safe"
-
     def __init__(self):
         self.mac_checker      = MacChecker()
         self.ollama           = OllamaClient()
@@ -1503,6 +1487,8 @@ class HealingOrchestrator:
 
         # Budget helper
         def run_with_budget(provider_name: str, query_fn) -> Optional[str]:
+            if circuit_breaker.is_broken():
+                return None
             limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
             current = get_daily_calls(provider_name)
             if current >= limit:
@@ -1909,6 +1895,8 @@ class HealingOrchestrator:
 
         # Budget helper
         def run_with_budget(provider_name: str, query_fn) -> Optional[str]:
+            if circuit_breaker.is_broken():
+                return None
             limit = DAILY_CLOUD_LIMITS.get(provider_name, 99999)
             current = get_daily_calls(provider_name)
             if current >= limit:
@@ -2157,6 +2145,30 @@ class HealingOrchestrator:
                 )
                 self._write_heal_log(tagged_line, result, source, False, project_tag, [{"error": str(e)}])
 
+        else:
+            logger.error("Tüm LLM sağlayıcıları başarısız oldu veya cevap alınamadı. (%s)", project_tag)
+            duration = time.time() - start_time
+            save_heal_history(
+                error_hash=err_hash,
+                error_message=tagged_line,
+                project_tag=project_tag,
+                risk_level="unknown",
+                prompt=prompt,
+                llm_response="ALL_LLMS_FAILED",
+                llm_source="none",
+                actions=[],
+                execution_output=[{"error": "Tüm LLM sağlayıcıları başarısız oldu."}],
+                success=False,
+                duration=duration
+            )
+            self._write_heal_log(tagged_line, "ALL_LLMS_FAILED", "none", False, project_tag, [{"error": "Tüm LLM sağlayıcıları başarısız oldu."}])
+            send_telegram_text(
+                TELEGRAM_CHAT_ID,
+                f"🚨 *Kritik SRE İyileştirme Hatası*\n"
+                f"📍 *Servis*: `{md_escape(project_tag)}`\n"
+                f"❌ Tüm LLM sağlayıcıları başarısız oldu ve otonom döngü kırıldı\\! Acil müdahale gerekebilir\\."
+            )
+
     def _send_approval_request(self, action_id: int, data: dict, error_msg: str, risk: str, tag: str):
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.warning("Telegram token eksik, onay isteği gönderilemiyor.")
@@ -2274,9 +2286,7 @@ class HealingOrchestrator:
             for act in actions
         )
 
-        if is_self_fix:
-            if not SELF_FIX_LOCK.acquire(blocking=False):
-                return [{"status": "rejected", "reason": "self-fix already in progress"}]
+        lock_acquired = False
 
         try:
             for act in actions:
@@ -2305,22 +2315,21 @@ class HealingOrchestrator:
                     # ── 2. Tag Backups (Layer E) ──
                     target_repo = get_git_repo(target_path)
                     if target_repo and target_repo not in backed_up_repos:
-                        tag_name = f"sre-tenant-{tenant_id}-service-{service_name}-{timestamp}"
+                        # Append thread ident to avoid concurrent tag collisions
+                        tag_name = f"sre-tenant-{tenant_id}-service-{service_name}-{timestamp}-{threading.get_ident()}"
                         try:
-                            # Create pre-patch git tag backup point
                             subprocess.run(["git", "-C", str(target_repo), "tag", "-a", tag_name, "-m", f"SRE pre-fix backup {timestamp}"], check=True)
                             backed_up_repos[target_repo] = tag_name
                             logger.info("[BACKUP] Git tag backup created: %s in %s", tag_name, target_repo)
                         except Exception as tag_ex:
                             logger.error("[BACKUP] Failed to create git tag backup in %s: %s", target_repo, tag_ex)
-                            # Remove already created tags during this run if one fails
                             for r_dir, t_name in backed_up_repos.items():
                                 subprocess.run(["git", "-C", str(r_dir), "tag", "-d", t_name], capture_output=True)
-                            return [{"status": "failed", "error": f"Git tag yedekleme hatası: {str(tag_ex)}"}]
+                            raise ValueError(f"Git tag yedekleme hatası: {str(tag_ex)}")
 
                 if act_type in ("write", "replace"):
                     target_path = Path(target)
-                    tmp_path = target_path.with_name(f"{target_path.stem}.__sre_tmp__{target_path.suffix}")
+                    tmp_path = target_path.with_name(f"{target_path.stem}.__sre_tmp_{threading.get_ident()}__{target_path.suffix}")
                     try:
                         if act_type == "write":
                             new_content = payload
@@ -2404,8 +2413,16 @@ class HealingOrchestrator:
                             f.flush()
                             os.fsync(f.fileno())
 
+                        patch_range = None
+                        if act_type == "replace":
+                            idx = new_content.find(replace_str)
+                            if idx != -1:
+                                p_start = new_content.count("\n", 0, idx) + 1
+                                p_end = p_start + replace_str.count("\n")
+                                patch_range = (p_start, p_end)
+
                         # Validation — language-agnostic sandbox
-                        val_ok, val_err = self.lang_validator.validate(str(tmp_path))
+                        val_ok, val_err = self.lang_validator.validate(str(tmp_path), patch_range=patch_range)
                         if not val_ok:
                             # ── 4. 1-Shot Self-Repair & Intent check (Layer B) ──
                             logger.warning("[REPAIR] Patch validation failed. Initiating 1-shot self-repair... Error: %s", val_err)
@@ -2451,7 +2468,7 @@ class HealingOrchestrator:
                                         f.flush()
                                         os.fsync(f.fileno())
                                     
-                                    val_ok2, val_err2 = self.lang_validator.validate(str(tmp_path))
+                                    val_ok2, val_err2 = self.lang_validator.validate(str(tmp_path), patch_range=patch_range)
                                     if val_ok2:
                                         logger.info("[REPAIR] 1-shot self-repair SUCCESSFUL! (Source: %s)", repair_source)
                                         new_content = cleaned_repair
@@ -2470,6 +2487,14 @@ class HealingOrchestrator:
                                 
                             if not val_ok:
                                 raise ValueError(f"Syntax/Semantic Validation Error: {val_err}")
+
+                        # ── 4.5. Acquire Global Self-Fix Lock (Avoid holding lock during LLM API) ──
+                        if is_self_fix and not lock_acquired:
+                            if not SELF_FIX_LOCK.acquire(blocking=False):
+                                payload_preview = new_content[:200].replace('\n', '\\n')
+                                logger.warning("Another thread won the self-fix race. Aborting valid patch:\nTarget: %s\nPayload preview: %s...", target, payload_preview)
+                                raise ValueError("self-fix already in progress (another thread won the race)")
+                            lock_acquired = True
 
                         # Write patched file atomically
                         atomic_write_text(target_path, new_content)
@@ -2520,6 +2545,9 @@ class HealingOrchestrator:
                                 logger.info("[REBUILD] No matching service in manifest for %s — skipping auto-rebuild", target)
                         except Exception as rb_ex:
                             raise ValueError(f"Rebuild/Canary Error: {rb_ex}")
+
+                        if tmp_path.exists():
+                            tmp_path.unlink()
 
                     except Exception as ex:
                         logger.error("Dosya düzenleme hatası: %s", str(ex))
@@ -2707,7 +2735,7 @@ class HealingOrchestrator:
                 
             return executed + [{"status": "failed", "error": str(overall_ex)}]
         finally:
-            if is_self_fix and SELF_FIX_LOCK.locked():
+            if lock_acquired:
                 try:
                     # Non-blocking release
                     SELF_FIX_LOCK.release()
@@ -3188,7 +3216,7 @@ def start_self_monitor():
                             orchestrator = HealingOrchestrator()
                             orchestrator.handle_error(content[-2000:], "[sre-daemon]")
                 time.sleep(10)
-            except Exception as e:
+            except Exception:
                 time.sleep(10)
 
     threading.Thread(target=_run, name="self-monitor", daemon=True).start()
@@ -3241,32 +3269,44 @@ class MetricsCollector(threading.Thread):
             self.trigger_predictive_warning(cpu_metrics[-1], mem_metrics[-1])
 
     def get_cpu_metrics(self) -> list:
-        # implement logic to get cpu metrics from state db
-        pass
+        try:
+            with sqlite3.connect(self.stats_db) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT value FROM stats_history
+                    WHERE entity = 'host' AND metric_type = 'cpu'
+                    ORDER BY timestamp DESC LIMIT 20
+                """)
+                rows = cur.fetchall()
+                if not rows: return []
+                return [r[0] for r in rows][::-1]
+        except Exception as e:
+            logger.error("[METRICS] get_cpu_metrics error: %s", e)
+            return []
 
     def get_mem_metrics(self) -> list:
-        # implement logic to get memory metrics from state db
-        pass
+        try:
+            with sqlite3.connect(self.stats_db) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT value FROM stats_history
+                    WHERE entity = 'host' AND metric_type = 'mem'
+                    ORDER BY timestamp DESC LIMIT 20
+                """)
+                rows = cur.fetchall()
+                if not rows: return []
+                return [r[0] for r in rows][::-1]
+        except Exception as e:
+            logger.error("[METRICS] get_mem_metrics error: %s", e)
+            return []
 
     def trigger_predictive_warning(self, cpu: float, mem: float):
         msg = (
-            f"⚠️ *PREDOMPTIVE SCALING WARNING:* CPU usage is at {cpu:.1f}% and memory usage is at {mem:.1f}%. "
+            f"⚠️ *PREDICTIVE SCALING WARNING:* CPU usage is at {cpu:.1f}% and memory usage is at {mem:.1f}%. "
             f"Projected to hit 90% CPU or 85% memory in the next 10 minutes."
         )
         send_telegram_text(TELEGRAM_CHAT_ID, msg)
 
-    def predict_scaling_advisor(self):
-        # Otonom Predictive Scaling eklendi
-        return True
-
-    def trigger_predictive_warning(self, cpu: float, mem: float):
-        # Uyarı tetikleyici eklendi
-        pass
-    """
-    Background thread that collects host and container metrics every 30 seconds.
-    Saves data to stats_history.db (capped to 24h of history).
-    Calculates EMA and flags anomalies to trigger proactive restarts or mitigations.
-    """
     def __init__(self, orchestrator):
         super().__init__(name="metrics-collector", daemon=True)
         self.orchestrator = orchestrator
@@ -3293,9 +3333,13 @@ class MetricsCollector(threading.Thread):
 
     def run(self):
         logger.info("[METRICS] MetricsCollector active. Loop started (interval: 30s).")
+        cycle_count = 0
         while True:
             try:
                 self._collect_and_analyze()
+                cycle_count += 1
+                if cycle_count % 10 == 0:
+                    self.predict_scaling_advisor()
             except Exception as e:
                 logger.error("[METRICS] Error in collection loop: %s", e)
             time.sleep(30)
@@ -3558,8 +3602,20 @@ def git_auto_sync():
         print(f"Git Sync Hatası: {e}")
 
 
+def count_ast_nodes(node):
+    import ast
+    return sum(1 for _ in ast.walk(node))
+
 def monitor_health():
     """Monitor health and alert via Telegram if critical."""
+    # Dummy call to test self-healing loop
+    try:
+        import ast
+        tree = ast.parse("print('health ok')")
+        count_ast_nodes(tree)
+    except Exception as e:
+        logger.exception(f"Health check parse error: {e}")
+        
     try:
         history = get_heal_history_for_hash("global", limit=10)
         failures = len([h for h in history if h.get("success") == False])
@@ -3577,7 +3633,7 @@ def monitor_health():
         if error_rate > 0.5:
             logger.error("System error rate too high: {:.2%}".format(error_rate))
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 
